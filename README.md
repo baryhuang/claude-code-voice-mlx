@@ -1,32 +1,105 @@
 # claude-code-voice-mlx
 
-**Hear Claude Code speak. Locally, in Chinese or English, 0.3 s to first sound.**
+**Voice output for parallel Claude Code sessions.**
+Run five agents at once and listen to them report back — in order, one at a time,
+each announcing which project it is.
 
-A text-to-speech (TTS) hook for [Claude Code](https://claude.com/claude-code) that
-reads its replies out loud using a neural voice running on Apple MLX — so you can
-code with your eyes off the screen. No API keys, no network, no per-character billing.
+Local neural text-to-speech on Apple MLX. 0.3 s to first sound, fully offline,
+no API keys.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-M1--M4-black?logo=apple)
 ![Offline](https://img.shields.io/badge/100%25-offline-green)
 ![Python](https://img.shields.io/badge/python-3.12-blue?logo=python&logoColor=white)
 
-> Voice input already works everywhere — dictation, Whisper, Wispr Flow. Voice
-> *output* is the missing half. Without it you still have to look at the screen,
-> and the whole point of talking to your agent is lost.
+---
+
+## The problem it solves
+
+Parallel agents are now normal. Multiple Claude Code sessions, one per git
+worktree, one per feature, all grinding at once. Nobody can watch five terminals.
+
+Bolting text-to-speech onto that makes it worse, not better: every session
+speaks the moment it finishes, so they talk over each other, and each new reply
+cuts off whatever was mid-word. The result is a pile of half-sentences from
+unidentified sources.
+
+**This project makes concurrent agents sound like one person reporting to you.**
+
+```
+"database migration finished, no errors."             ← backend session
+"frontend — build failed, a dependency is missing."   ← name announced on switch
+"backend — tests pass too, ready to merge."           ← and again on switch back
+```
+
+One global queue. Utterances finish before the next begins. The project name is
+spoken only when the speaker changes, so a single active session never gets
+chatty.
 
 ---
 
-## Why this one
+## Core design
 
-There are already several Claude Code TTS plugins. This one is different in three ways:
+### One global queue across every session
 
-| | This project | Typical alternative |
-| --- | --- | --- |
-| **Time to first sound** | **0.3 s** — resident daemon + sentence pipelining | 3–8 s — model loaded per call |
-| **What gets spoken** | Only the `🔊` summary line you write | The entire reply, markdown and all |
-| **Chinese** | First-class, 8 Mandarin voices, correct `lang_code` + `misaki[zh]` g2p | Often English-only or broken |
-| **Cost / network** | Zero, fully offline | OpenAI / ElevenLabs API key |
+The daemon is a single process, which makes it the natural serialization point.
+Every session pushes into one FIFO; playback runs strictly in order.
+
+- **No overlap.** An utterance plays to completion before the next starts.
+- **No truncation.** A newly finished session waits its turn instead of cutting in.
+- **Source identification.** The project directory name is announced on speaker
+  change, and suppressed while one session keeps the floor.
+- **Per-session barge-in.** Typing into session A cancels *A's* queued audio.
+  Session B keeps talking, because B was not interrupted.
+
+Queue depth is returned on every enqueue and visible via `ping`, so backlog is
+observable rather than guessed at.
+
+### Resident model, non-blocking hook
+
+Kokoro loads in ~1 s. Paying that per reply is worse than a robotic built-in
+voice. The daemon holds the model in memory; the hook pushes a line over a unix
+socket and returns in **0.00 s**, so Claude Code is never blocked.
+
+If the daemon is not running, the hook starts it in the background and falls
+back to macOS `say` for that one line. Silence is never a possible outcome.
+
+### Sentence pipelining
+
+Synthesizing an entire reply before playback means ten seconds of dead air. Text
+is split into sentences; each is synthesized and queued while the previous one
+plays. The first chunk is capped shorter than the rest to win the
+time-to-first-sound race.
+
+```
+117 chars → 3 chunks → first audio at 0.34 s
+```
+
+Pipelining crosses utterance boundaries: the next session's audio is already
+synthesized and waiting when the current one finishes, so the queue introduces
+no gap.
+
+### Speak the summary, not the reply
+
+Listening is roughly 10× slower than reading. A reply that scans in five seconds
+takes a minute to hear. The agent writes one `🔊` line and **only that line is
+spoken**; the screen keeps the full detail.
+
+```markdown
+🔊 Tests pass, deployed to staging. Want me to promote it?
+
+## Details
+...full markdown, code blocks, tables — none of it is read aloud...
+```
+
+Add this to `~/.claude/CLAUDE.md`:
+
+```markdown
+Every reply must start with a 🔊 line: one sentence, under 50 characters,
+plain spoken language, no code or paths. Only that line is read aloud.
+```
+
+Without a `🔊` line it falls back to speaking the cleaned full text.
 
 ---
 
@@ -50,115 +123,37 @@ python3 install.py
 ~/.claude/hooks/voice_hook.py --test
 ```
 
-That's it. Every Claude Code session on the machine now talks. Hook changes are
-picked up live — no restart needed.
-
-To uninstall: `python3 install.py --uninstall`
+Every Claude Code session on the machine now talks. Hook changes are picked up
+live — no restart needed. Uninstall with `python3 install.py --uninstall`.
 
 ---
 
-## How it works
+## Hooks
 
-Three hooks, one resident model:
-
-| Hook event | What happens |
+| Event | Behavior |
 | --- | --- |
-| `Stop` | Claude finished a reply → extract the `🔊` line → speak it |
-| `Notification` | "needs your permission to use Bash" → speak it, so you're not waiting blind |
-| `UserPromptSubmit` | You start talking → cut the audio mid-sentence |
-
-### Design decision 1 — a resident daemon
-
-Kokoro loads in ~1 s. Doing that on every reply is worse than the robotic
-built-in voice. So `tts_daemon.py` stays resident with the model in memory, and
-the hook just pushes a line of text over a unix socket and returns in **0.00 s**
-— Claude Code is never blocked.
-
-If the daemon isn't up, the hook starts it in the background **and falls back to
-macOS `say` for that one line**. You never get silence.
-
-### Design decision 2 — sentence pipelining
-
-Synthesizing a whole reply before playing it means 10+ seconds of dead air.
-Instead the text is split into sentences, each synthesized and queued as the
-previous one plays. The first chunk is capped shorter than the rest specifically
-to win the time-to-first-sound race.
-
-```
-117 chars → 3 chunks → first audio at 0.34 s
-```
-
-### Design decision 3 — one global queue across all sessions
-
-Run three Claude Code sessions at once and a naive implementation talks over
-itself, or lets the newest reply cut off the previous one mid-word. You end up
-hearing a pile of half-sentences.
-
-The daemon is a single process, so it is the natural serialization point. Every
-session pushes into **one global FIFO** and utterances play to completion, one
-after another — like a person who finishes their sentence before starting the
-next.
-
-When the speaker changes, the project directory name is announced first, so you
-know who is talking:
-
-```
-"database migration finished, no errors."          ← backend session
-"frontend — build failed, a dependency is missing." ← name announced on switch
-"backend — tests pass too, ready to merge."         ← and again on switch back
-```
-
-Barge-in is scoped per session: typing into session A cancels **A's** queued
-audio only. Session B keeps talking, because you did not interrupt B.
-
-### Design decision 4 — speak the summary, not the reply
-
-Listening is ~10× slower than reading. A reply that scans in 5 seconds takes a
-minute to hear. So the agent writes one `🔊` line and **only that line is
-spoken** — the screen keeps the full detail.
-
-```markdown
-🔊 Tests pass, deployed to staging. Want me to promote it?
-
-## Details
-...full markdown, code blocks, tables — none of it is read aloud...
-```
-
-Add this to your `~/.claude/CLAUDE.md` so the agent actually writes that line:
-
-```markdown
-Every reply must start with a 🔊 line: one sentence, under 50 characters,
-plain spoken language, no code or paths. Only that line is read aloud.
-```
-
-No `🔊` line? It falls back to speaking the cleaned full text, so nothing breaks.
+| `Stop` | Reply finished → extract the `🔊` line → enqueue for playback |
+| `Notification` | "needs your permission to use Bash" → spoken, so no blind waiting |
+| `UserPromptSubmit` | Cancels that session's audio only |
 
 ---
 
-## Text cleaning
+## Comparison
 
-Raw markdown read aloud is unbearable. Before synthesis:
-
-- fenced code blocks → "(a code block)"
-- `/Users/you/git/project/src/thing.py` → `thing.py`
-- URLs, emoji, `**`, `##`, `-`, table pipes → gone
-- thinking blocks and mid-task tool commentary → never spoken, only the final reply
+| | This project | Typical Claude Code TTS plugin |
+| --- | --- | --- |
+| **Concurrent sessions** | **Global queue, ordered, source announced** | Sessions talk over each other |
+| **Barge-in scope** | Per session | Global, or none |
+| **Time to first sound** | **0.3 s** — resident daemon + pipelining | 3–8 s — model loaded per call |
+| **What is spoken** | Only the `🔊` summary line | The entire reply, markdown included |
+| **Chinese** | 8 Mandarin voices, correct `lang_code` + `misaki[zh]` g2p | Often English-only or broken |
+| **Cost / network** | Zero, fully offline | OpenAI / ElevenLabs API key |
 
 ---
 
-## Voices
+## Configuration
 
-Eight Mandarin voices ship with Kokoro:
-
-| Voice | Note |
-| --- | --- |
-| `zf_xiaoxiao` *(default)* | standard Mandarin, female |
-| `zf_xiaoyi` | standard Mandarin, female |
-| `zm_yunxi` `zm_yunyang` `zm_yunjian` `zm_yunxia` | standard Mandarin, male |
-| `zf_xiaobei` | ⚠️ **Liaoning dialect** — sounds distinctly regional |
-| `zf_xiaoni` | ⚠️ **Shaanxi dialect** |
-
-Set in `~/.claude/voice_config.json`:
+`~/.claude/voice_config.json`:
 
 ```json
 {
@@ -167,22 +162,44 @@ Set in `~/.claude/voice_config.json`:
   "model": "mlx-community/Kokoro-82M-bf16",
   "kokoro_voice": "zf_xiaoxiao",
   "speed": 1.0,
-  "max_chars": 700
+  "max_chars": 700,
+  "announce_session": true
 }
 ```
 
-English voices (`af_heart`, `am_michael`, …) work too — set `lang_code` to `a`.
+Set `announce_session` to `false` to suppress project-name announcements.
+
+### Voices
+
+| Voice | Note |
+| --- | --- |
+| `zf_xiaoxiao` *(default)* | standard Mandarin, female |
+| `zf_xiaoyi` | standard Mandarin, female |
+| `zm_yunxi` `zm_yunyang` `zm_yunjian` `zm_yunxia` | standard Mandarin, male |
+| `zf_xiaobei` | ⚠️ **Liaoning dialect** — distinctly regional |
+| `zf_xiaoni` | ⚠️ **Shaanxi dialect** |
+
+English voices (`af_heart`, `am_michael`, …) work with `lang_code` set to `a`.
+
+---
+
+## Text cleaning
+
+Raw markdown read aloud is unusable. Before synthesis:
+
+- fenced code blocks → "(a code block)"
+- `/Users/you/git/project/src/thing.py` → `thing.py`
+- URLs, emoji, `**`, `##`, `-`, table pipes → removed
+- thinking blocks and mid-task tool commentary → never spoken; only the final reply
 
 ---
 
 ## Troubleshooting
 
-### `say` runs fine but there is no sound
+### `say` exits 0 but there is no sound
 
-macOS lists Chinese voices that were never actually downloaded. They **exit 0 and
-emit silence** — the nastiest failure mode there is, because nothing looks wrong.
-
-Measure the synthesized file size instead:
+macOS lists Chinese voices whose voice packs were never downloaded. They **exit 0
+and emit silence**, so nothing appears wrong. Detect it by synthesized file size:
 
 ```bash
 ~/.claude/hooks/voice_hook.py --voices
@@ -194,31 +211,30 @@ Meijia     120606 bytes  ✅
 Sinji      118574 bytes  ✅
 Sandy        4800 bytes  ❌ voice pack not installed
 Eddy         4800 bytes  ❌
-...
 ```
 
-Silence is a constant ~4800 bytes; real speech is six figures. Download the rest
+Silence is a constant ~4800 bytes; real speech is six figures. Install the rest
 under *System Settings → Accessibility → Spoken Content → System Voice → Manage Voices*.
 
-### Kokoro errors with `No module named 'misaki'`
+### `No module named 'misaki'`
 
-Chinese needs the grapheme-to-phoneme package, and the call must pass
-`lang_code="z"` explicitly — otherwise Kokoro loads the English g2p and dies:
+Chinese requires the grapheme-to-phoneme package, and `lang_code="z"` must be
+passed explicitly or Kokoro loads the English g2p and fails:
 
 ```bash
 uv pip install --python ~/.claude/voice-tts/bin/python "misaki[zh,en]"
 ```
 
-### It speaks an empty reply / stays silent at the end of a turn
+### Nothing is spoken at the end of a turn
 
-The `Stop` hook and the transcript write are a race — the hook often runs before
-the final line is flushed to disk. Handled by retrying for up to 900 ms.
+The `Stop` hook and the transcript write race each other; the hook frequently
+runs before the final line is flushed. Handled by retrying for up to 900 ms.
 
 ### Logs
 
 ```bash
-tail -f ~/.claude/voice_hook.log          # hook: which event, how many chars
-tail -f ~/.claude/voice_tts_daemon.log    # daemon: model load, first-chunk latency
+tail -f ~/.claude/voice_hook.log          # event, session, character count
+tail -f ~/.claude/voice_tts_daemon.log    # queue depth, first-chunk latency
 ```
 
 ---
@@ -235,18 +251,18 @@ Apple M3 Pro, 36 GB, Kokoro-82M bf16, warm:
 
 Resident memory ≈ 200 MB. Model on disk ≈ 340 MB.
 
-### Models evaluated and rejected
+### Model selection
 
-| Model | Real-time factor | Verdict |
+| Model | Real-time factor | Status |
 | --- | --- | --- |
-| **Kokoro-82M** | **10–18×** | ✅ shipped |
-| Qwen3-TTS 1.7B VoiceDesign | 1.2× | Great Chinese, describable voices, far too slow |
-| BlueMagpie-TTS (Taiwanese accent) | 1.3× (MLX) | Best Taiwanese-accent model available; 8 GB and too slow |
-| macOS `say` | instant | Robotic; kept only as the cold-start fallback |
+| **Kokoro-82M** | **10–18×** | shipped |
+| Qwen3-TTS 1.7B VoiceDesign | 1.2× | strong Chinese and describable voices, too slow |
+| [BlueMagpie-TTS](https://github.com/OpenFormosa/BlueMagpie-TTS) | 1.3× (MLX) | best Taiwanese-accent model available, 8 GB, too slow |
+| macOS `say` | instant | robotic; retained as cold-start fallback |
 
-No open model currently ships a **Taiwanese-accent** Mandarin preset. The routes
-are voice cloning or [BlueMagpie-TTS](https://github.com/OpenFormosa/BlueMagpie-TTS),
-both of which cost more latency than an interactive coding loop can absorb today.
+A queue only sounds natural when each item starts promptly. Real-time factor
+below roughly 5× makes backlog audible, which rules out the larger models for
+interactive use today.
 
 ---
 
@@ -254,42 +270,45 @@ both of which cost more latency than an interactive coding loop can absorb today
 
 | File | Role |
 | --- | --- |
-| `voice_hook.py` | Hook entry point — transcript parsing, cleaning, routing, `say` fallback |
-| `tts_daemon.py` | Resident Kokoro server — sentence pipelining, playback queue, barge-in |
+| `voice_hook.py` | Hook entry point — transcript parsing, cleaning, session routing, `say` fallback |
+| `tts_daemon.py` | Resident Kokoro server — global queue, sentence pipelining, per-session cancel |
 | `install.py` | Copies both into `~/.claude/hooks/` and registers the hooks |
 
-The hook is installed **into `~/.claude/hooks/`, not run from the clone** — a
-global hook should not break because you moved a directory.
+Hooks are installed **into `~/.claude/hooks/`, not run from the clone** — a global
+hook should not break when a directory moves.
 
 ---
 
 ## 中文说明
 
-语音输入早就够用了，缺的是语音输出。听不到就还得盯屏幕，那跟语音助手对话就没意义了。
+并行跑 agent 已经是常态：多个 Claude Code 会话，一个 worktree 一个，同时开工。
+没人看得过来五个终端。
 
-这是给 Claude Code 装的本地语音播报，用 Kokoro 神经网络模型跑在苹果 MLX 上，
-**开口 0.3 秒，全程离线，不花一分钱**。
+直接加语音只会更糟——每个会话一说完就抢着播，互相打断，听到的是一堆半截话，
+还不知道是哪个项目在说。
 
-三个设计要点：
+**这个项目让并行的 agent 听起来像一个人在向你汇报。**
 
-1. **常驻服务** — 模型待在内存里，hook 通过 unix socket 丢一句话就返回，不拖慢 Claude
-2. **按句流水线** — 边合成边播，首句 0.34 秒出声，跟整段多长无关
-3. **只念摘要** — 回复第一行标 `🔊`，只念那一行，屏幕上保留全部细节
+全局一个队列，一句说完再说下一句；换会话时先报项目名，同一个会话连着说就不报。
+打断也是分会话的——你在 A 会话开口，只掐 A 的语音，B 继续说完。
 
-安装看上面 [Quick start](#quick-start)。中文音色八个，默认晓晓；
-注意 `zf_xiaobei` 是辽宁方言、`zf_xiaoni` 是陕西方言，别选错。
+引擎是 Kokoro 神经网络模型跑在苹果 MLX 上，**开口 0.3 秒，全程离线，不花钱**。
 
-最大的坑：**macOS 列出来的中文声音大部分语音包没装，合成出来是静音，而且退出码是 0**。
+中文音色八个，默认晓晓。注意 `zf_xiaobei` 是辽宁方言、`zf_xiaoni` 是陕西方言。
+
+最大的坑：**macOS 列出来的中文声音大部分语音包没装，合成出来是静音，退出码还是 0**。
 用 `--voices` 自检，静音恒定 4800 字节。
 
 ---
 
 ## Keywords
 
-Claude Code text-to-speech · Claude Code TTS hook · local TTS macOS ·
-Apple MLX text-to-speech · Kokoro TTS Chinese · offline neural TTS Apple Silicon ·
-hands-free coding · eyes-free programming · accessibility for developers ·
-voice coding assistant · 中文语音合成 · 本地 TTS · 语音编程
+parallel Claude Code sessions · multi-agent voice output · concurrent AI agents ·
+agent orchestration audio feedback · speech queue for multiple sessions ·
+Claude Code TTS hook · local text-to-speech macOS · Apple MLX text-to-speech ·
+Kokoro TTS Chinese · offline neural TTS Apple Silicon · git worktree parallel agents ·
+hands-free coding · eyes-free programming · developer accessibility ·
+中文语音合成 · 本地 TTS · 多会话语音播报 · 并行 agent 语音
 
 ## License
 
