@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.wav
+*.aiff
+.venv/
+venv/
+
+# 本机数据，不进仓库
+openmemory.sqlite
+*.sqlite
+*.log
