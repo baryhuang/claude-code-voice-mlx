@@ -134,9 +134,10 @@ def daemon_spawn():
 # 说话
 # --------------------------------------------------------------------------
 
-def stop_speaking():
-    """掐掉上一句还在念的话，避免几段语音叠在一起。两个引擎都要管。"""
-    daemon_request({"cmd": "stop"}, timeout=0.5)
+def stop_speaking(session=None):
+    """掐掉还在念的话。只掐自己这一路——你在 A 会话敲键盘，
+    不该让 B 会话的播报也跟着断。"""
+    daemon_request({"cmd": "stop", "session": session}, timeout=0.5)
     try:
         with open(PID_PATH) as f:
             pid = int(f.read().strip())
@@ -158,15 +159,17 @@ def stop_speaking():
         pass
 
 
-def speak(text, cfg):
+def speak(text, cfg, session=None, label=None):
     text = text.strip()
     if not text:
         log("speak: 文本为空，跳过")
         return
 
     if cfg.get("engine") == "kokoro":
-        if daemon_request({"cmd": "speak", "text": text}):
-            log(f"speak: 交给 kokoro，{len(text)} 字")
+        resp = daemon_request({"cmd": "speak", "text": text,
+                               "session": session, "label": label})
+        if resp:
+            log(f"speak: 交给 kokoro，{len(text)} 字，队列深度 {resp.get('queue')}")
             return
         # 服务没起来：拉起它，但这一句先用 say 兜底，别让用户干等
         daemon_spawn()
@@ -376,15 +379,19 @@ def handle_hook(cfg):
         return
 
     event = payload.get("hook_event_name", "")
-    log(f"hook: 收到事件 {event!r}")
+    # 多会话时得知道是谁在说话。用目录名当人话标签，session_id 用来定向取消。
+    session = payload.get("session_id") or "unknown"
+    cwd = payload.get("cwd") or ""
+    label = os.path.basename(cwd.rstrip("/")).replace("_", " ").replace("-", " ")
+    log(f"hook: 收到事件 {event!r} [{label}]")
 
     if event == "UserPromptSubmit":
-        stop_speaking()          # 你一开口，它就闭嘴
+        stop_speaking(session)   # 你一开口，只掐这个会话的
         return
 
     if event == "Notification":
         if cfg.get("speak_notifications", True):
-            speak(notification_text(payload.get("message", "")), cfg)
+            speak(notification_text(payload.get("message", "")), cfg, session, label)
         return
 
     if event in ("Stop", "SubagentStop"):
@@ -409,7 +416,7 @@ def handle_hook(cfg):
         else:
             log(f"Stop: 无 🔊 标记，念全文 {len(raw)} 字")
             text = truncate_for_speech(clean_for_speech(raw), int(cfg["max_chars"]))
-        speak(text, cfg)
+        speak(text, cfg, session, label)
         return
 
 

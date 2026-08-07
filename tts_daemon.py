@@ -7,10 +7,14 @@
 为什么按句切：整段合成完再播，开口前要干等十几秒。切成句子后，
 第一句（十几个字）半秒就出来了，边播边合成后面的，开口延迟只跟第一句有关。
 
+为什么要排队：多个 Claude 会话同时干活时，如果后来的掐掉前面的，
+你会听到一堆半截话。所以这里是全局的串行点——所有会话共用一个队列，
+一句一句说完，换会话时先报一下是哪个项目在说话。
+
 协议（unix socket，一行一个 JSON）：
-    {"cmd": "speak", "text": "..."}
-    {"cmd": "stop"}
-    {"cmd": "ping"}   -> {"ok": true, "model": "..."}
+    {"cmd": "speak", "text": "...", "session": "...", "label": "项目名"}
+    {"cmd": "stop", "session": "..."}    # 不带 session 就是全停
+    {"cmd": "ping"}    -> {"ok": true, "model": ..., "queue": 队列长度}
 """
 
 import json
@@ -31,7 +35,7 @@ LOG_PATH = os.path.join(HOME, ".claude", "voice_tts_daemon.log")
 CONFIG_PATH = os.path.join(HOME, ".claude", "voice_config.json")
 
 DEFAULT_MODEL = "mlx-community/Kokoro-82M-bf16"
-DEFAULT_VOICE = "zf_xiaobei"
+DEFAULT_VOICE = "zf_xiaoxiao"
 DEFAULT_SPEED = 1.0
 DEFAULT_LANG = "z"          # Kokoro 的中文语种码，不传会去加载英文 g2p 然后报错
 TARGET_PEAK = 0.9           # Kokoro 输出峰值只有 0.3 左右，比 say 明显轻，要拉齐
@@ -54,7 +58,8 @@ def log(msg):
 
 def load_config():
     cfg = {"model": DEFAULT_MODEL, "kokoro_voice": DEFAULT_VOICE,
-           "speed": DEFAULT_SPEED, "lang_code": DEFAULT_LANG}
+           "speed": DEFAULT_SPEED, "lang_code": DEFAULT_LANG,
+           "announce_session": True}
     try:
         with open(CONFIG_PATH) as f:
             cfg.update({k: v for k, v in json.load(f).items() if k in cfg})
@@ -111,10 +116,18 @@ class Engine:
         self.cfg = cfg
         self.model = None
         self.sample_rate = 24000
-        self.gen = 0                      # 代号：换一句就 +1，老的合成结果直接丢掉
+
+        self.utt_q = queue.Queue()      # 待朗读的整段话
+        self.play_q = queue.Queue()     # 已合成好的音频片段
         self.lock = threading.Lock()
-        self.play_q = queue.Queue()
+        self.next_id = 0
+        self.utt_session = {}           # utt_id -> session，用来定向取消
+        self.cancelled = set()
         self.player = None
+        self.playing_utt = None
+        self.last_session = None        # 换会话时才报项目名
+
+        threading.Thread(target=self._synth_loop, daemon=True).start()
         threading.Thread(target=self._play_loop, daemon=True).start()
 
     # -- 模型 ------------------------------------------------------------
@@ -156,13 +169,96 @@ class Engine:
             wav = wav * (TARGET_PEAK / peak)
         return wav
 
-    # -- 播放 ------------------------------------------------------------
+    # -- 入队 ------------------------------------------------------------
+    def enqueue(self, text, session, label):
+        """排到队尾。不打断正在说的那句——多会话时那样会变成一堆半截话。"""
+        text = (text or "").strip()
+        if not text:
+            return 0
+        with self.lock:
+            self.next_id += 1
+            utt_id = self.next_id
+            self.utt_session[utt_id] = session
+        self.utt_q.put((utt_id, session, label, text))
+        depth = self.utt_q.qsize()
+        log(f"入队 #{utt_id} [{label}] {len(text)}字，队列深度 {depth}")
+        return depth
+
+    def stop(self, session=None):
+        """取消某个会话的朗读。不给 session 就全停。
+
+        只掐自己那一路：你在 A 会话敲键盘，不该让 B 会话的播报也断掉。
+        """
+        with self.lock:
+            if session is None:
+                victims = set(self.utt_session)
+            else:
+                victims = {u for u, s in self.utt_session.items() if s == session}
+            self.cancelled |= victims
+            hit_current = self.playing_utt in victims
+        p = self.player
+        if hit_current and p and p.poll() is None:
+            try:
+                p.kill()
+            except Exception:
+                pass
+        if victims:
+            log(f"取消 {len(victims)} 段（session={session or '全部'}）")
+
+    def _is_dead(self, utt_id):
+        with self.lock:
+            return utt_id in self.cancelled
+
+    # -- 合成线程 --------------------------------------------------------
+    def _synth_loop(self):
+        while True:
+            utt_id, session, label, text = self.utt_q.get()
+            if self._is_dead(utt_id):
+                self._forget(utt_id)
+                continue
+            try:
+                self._synth_utterance(utt_id, session, label, text)
+            except Exception as e:
+                log(f"合成整段失败 #{utt_id} {e!r}")
+            self._forget(utt_id)
+
+    def _synth_utterance(self, utt_id, session, label, text):
+        chunks = split_sentences(text)
+        # 换了会话才报项目名，一直是同一个会话就别啰嗦
+        if (self.cfg.get("announce_session") and label
+                and self.last_session is not None and session != self.last_session):
+            chunks.insert(0, f"{label}，")
+        self.last_session = session
+
+        t0 = time.time()
+        for i, chunk in enumerate(chunks):
+            if self._is_dead(utt_id):
+                log(f"#{utt_id} 合成中被取消")
+                return
+            wav = self._synth(chunk)
+            if wav is None or not len(wav):
+                continue
+            fd, path = tempfile.mkstemp(suffix=".wav", prefix="voice_")
+            os.close(fd)
+            import soundfile as sf
+            sf.write(path, wav, self.sample_rate)
+            if i == 0:
+                log(f"#{utt_id} 首句就绪 {time.time() - t0:.2f}s")
+            self.play_q.put((utt_id, path))
+
+    def _forget(self, utt_id):
+        with self.lock:
+            self.utt_session.pop(utt_id, None)
+            self.cancelled.discard(utt_id)
+
+    # -- 播放线程 --------------------------------------------------------
     def _play_loop(self):
         while True:
-            gen, path = self.play_q.get()
-            if gen != self.gen:               # 过期的片段，跳过
+            utt_id, path = self.play_q.get()
+            if self._is_dead(utt_id):
                 self._rm(path)
                 continue
+            self.playing_utt = utt_id
             try:
                 self.player = subprocess.Popen(
                     ["/usr/bin/afplay", path],
@@ -173,6 +269,7 @@ class Engine:
                 log(f"播放失败 {e!r}")
             finally:
                 self.player = None
+                self.playing_utt = None
                 self._rm(path)
 
     @staticmethod
@@ -181,51 +278,6 @@ class Engine:
             os.remove(path)
         except OSError:
             pass
-
-    def stop(self):
-        with self.lock:
-            self.gen += 1
-        while not self.play_q.empty():
-            try:
-                self._rm(self.play_q.get_nowait()[1])
-            except queue.Empty:
-                break
-        p = self.player
-        if p and p.poll() is None:
-            try:
-                p.kill()
-            except Exception:
-                pass
-
-    # -- 主流程 ----------------------------------------------------------
-    def speak(self, text):
-        self.stop()
-        with self.lock:
-            gen = self.gen
-        threading.Thread(target=self._speak_worker, args=(text, gen), daemon=True).start()
-
-    def _speak_worker(self, text, gen):
-        import soundfile as sf
-        chunks = split_sentences(text)
-        log(f"开念：{len(text)} 字 -> {len(chunks)} 句")
-        t0 = time.time()
-        for i, chunk in enumerate(chunks):
-            if gen != self.gen:
-                log("被打断，停止合成")
-                return
-            try:
-                wav = self._synth(chunk)
-            except Exception as e:
-                log(f"合成失败 {chunk[:20]!r} {e!r}")
-                continue
-            if wav is None or not len(wav):
-                continue
-            fd, path = tempfile.mkstemp(suffix=".wav", prefix="voice_")
-            os.close(fd)
-            sf.write(path, wav, self.sample_rate)
-            if i == 0:
-                log(f"首句就绪，延迟 {time.time() - t0:.2f}s")
-            self.play_q.put((gen, path))
 
 
 # --------------------------------------------------------------------------
@@ -264,14 +316,17 @@ def serve():
             req = json.loads(data) if data else {}
             cmd = req.get("cmd")
             if cmd == "ping":
-                conn.sendall(json.dumps({"ok": True, "model": cfg["model"],
-                                         "voice": cfg["kokoro_voice"]}).encode())
+                conn.sendall(json.dumps({
+                    "ok": True, "model": cfg["model"], "voice": cfg["kokoro_voice"],
+                    "queue": engine.utt_q.qsize(),
+                }).encode())
             elif cmd == "stop":
-                engine.stop()
+                engine.stop(req.get("session"))
                 conn.sendall(b'{"ok":true}')
             elif cmd == "speak":
-                engine.speak(req.get("text", ""))
-                conn.sendall(b'{"ok":true}')
+                depth = engine.enqueue(req.get("text", ""),
+                                       req.get("session"), req.get("label"))
+                conn.sendall(json.dumps({"ok": True, "queue": depth}).encode())
             else:
                 conn.sendall(b'{"ok":false}')
         except Exception as e:

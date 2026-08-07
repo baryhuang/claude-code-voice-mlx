@@ -88,7 +88,30 @@ to win the time-to-first-sound race.
 117 chars → 3 chunks → first audio at 0.34 s
 ```
 
-### Design decision 3 — speak the summary, not the reply
+### Design decision 3 — one global queue across all sessions
+
+Run three Claude Code sessions at once and a naive implementation talks over
+itself, or lets the newest reply cut off the previous one mid-word. You end up
+hearing a pile of half-sentences.
+
+The daemon is a single process, so it is the natural serialization point. Every
+session pushes into **one global FIFO** and utterances play to completion, one
+after another — like a person who finishes their sentence before starting the
+next.
+
+When the speaker changes, the project directory name is announced first, so you
+know who is talking:
+
+```
+"database migration finished, no errors."          ← backend session
+"frontend — build failed, a dependency is missing." ← name announced on switch
+"backend — tests pass too, ready to merge."         ← and again on switch back
+```
+
+Barge-in is scoped per session: typing into session A cancels **A's** queued
+audio only. Session B keeps talking, because you did not interrupt B.
+
+### Design decision 4 — speak the summary, not the reply
 
 Listening is ~10× slower than reading. A reply that scans in 5 seconds takes a
 minute to hear. So the agent writes one `🔊` line and **only that line is
