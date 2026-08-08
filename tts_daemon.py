@@ -235,6 +235,26 @@ class Engine:
             log(f"取消 {len(victims)} 段（session={session or '全部'}）")
             self.write_status()
 
+    def skip_current(self):
+        """只掐正在播的这一段，队列里后面的照常接着播。
+
+        用户喊"闭嘴"针对的是耳朵里这段，不是整个队列——别的会话
+        排队等着的汇报他还要听。
+        """
+        with self.lock:
+            cur = self.playing_utt
+            if cur is not None:
+                self.cancelled.add(cur)
+        p = self.player
+        if cur is not None and p and p.poll() is None:
+            try:
+                p.kill()
+            except Exception:
+                pass
+        if cur is not None:
+            log(f"跳过正在播的 #{cur}，队列继续")
+        return cur
+
     def _is_dead(self, utt_id):
         with self.lock:
             return utt_id in self.cancelled
@@ -387,6 +407,9 @@ def serve():
             elif cmd == "stop":
                 engine.stop(req.get("session"))
                 conn.sendall(b'{"ok":true}')
+            elif cmd == "skip":
+                skipped = engine.skip_current()
+                conn.sendall(json.dumps({"ok": True, "skipped": skipped}).encode())
             elif cmd == "speak":
                 depth = engine.enqueue(req.get("text", ""),
                                        req.get("session"), req.get("label"))

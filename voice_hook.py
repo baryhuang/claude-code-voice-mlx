@@ -398,13 +398,15 @@ def handle_hook(cfg):
         prompt = payload.get("prompt") or ""
         if QUIET_RE.search(prompt):
             import time
-            stop_speaking(None)  # 明确让闭嘴：所有会话全停
+            # "闭嘴"针对的是耳朵里正在播的这段——跳过它就好，
+            # 队列里其他会话排着的汇报他还要听，不能全清掉
+            daemon_request({"cmd": "skip"})
             try:
                 with open(MUTE_PATH, "w") as f:
                     json.dump({"session": session, "ts": time.time()}, f)
             except Exception:
                 pass
-            log("quiet: 全局停，且下一条回复静音")
+            log("quiet: 跳过当前段，队列继续，下一条回复静音")
         return
 
     if event == "Notification":
