@@ -1,6 +1,7 @@
 # claude-code-voice-mlx
 
-Text-to-speech output for Claude Code on macOS. Replies are synthesized by
+**Claude Code talks on your Mac.** Text-to-speech output for Claude Code on
+macOS / Apple Silicon. Replies are synthesized by
 Kokoro-82M running locally on Apple MLX and played through the system audio
 output. Concurrent sessions share one playback queue: utterances play
 sequentially, the project name is announced when the speaking session changes,
@@ -288,7 +289,7 @@ audible as start-of-utterance delay, which defeats the ordered-queue design.
 
 ## 中文说明
 
-给 Claude Code 加语音输出：回复由本地 MLX 上的 Kokoro-82M 合成播放，
+在 Mac 上给 Claude Code 加语音输出：回复由本地 MLX 上的 Kokoro-82M 合成播放，
 模型下载后不需要网络。
 
 多个会话共用一个播放队列，按入队顺序一段一段播完；换会话时报一次项目目录名，
