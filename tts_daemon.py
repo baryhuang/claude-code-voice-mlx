@@ -244,15 +244,13 @@ class Engine:
         while True:
             utt_id, session, label, text = self.utt_q.get()
             if self._is_dead(utt_id):
-                self._forget(utt_id)
                 self._finish_playback(utt_id)
                 continue
             try:
                 self._synth_utterance(utt_id, session, label, text)
             except Exception as e:
                 log(f"合成整段失败 #{utt_id} {e!r}")
-            self._forget(utt_id)
-            # 哨兵：这一段的音频到此为止，播放线程见到它才知道该收尾
+            # 哨兵：这一段的音频到此为止，播放线程见到它才收尾清账
             self.play_q.put((utt_id, None))
 
     def _synth_utterance(self, utt_id, session, label, text):
@@ -279,15 +277,16 @@ class Engine:
                 log(f"#{utt_id} 首句就绪 {time.time() - t0:.2f}s")
             self.play_q.put((utt_id, path))
 
-    def _forget(self, utt_id):
-        """合成阶段结束。播放可能还在进行，meta 和 pending 留给播放线程清。"""
-        with self.lock:
-            self.utt_session.pop(utt_id, None)
-
     def _finish_playback(self, utt_id):
+        """整段彻底结束（播完或取消）才清账。
+
+        utt_session 必须留到这里才能删：合成比播放快十几倍，要是合成一结束
+        就清掉，用户开口打断时按会话找目标就永远扑空——正在播的那段反而杀不掉。
+        """
         with self.lock:
             if utt_id in self.pending:
                 self.pending.remove(utt_id)
+            self.utt_session.pop(utt_id, None)
             self.utt_meta.pop(utt_id, None)
             self.cancelled.discard(utt_id)
         self.write_status()

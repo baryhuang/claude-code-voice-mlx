@@ -244,6 +244,14 @@ def clean_for_speech(md):
 
 SPOKEN_RE = re.compile(r"^\s*🔊[ \t]*(.+?)\s*$", re.M)
 
+# "闭嘴"类口令：全局停 + 静音下一条回复（不然回复"好的"又念出来了）
+QUIET_RE = re.compile(
+    r"不要说|不要念|别说了|別說|闭嘴|閉嘴|安静|安靜|别念|停下|"
+    r"stop talking|be quiet|shut up|quiet",
+    re.I,
+)
+MUTE_PATH = os.path.join(HOME, ".claude", ".voice_mute.json")
+
 
 def extract_spoken(raw):
     """只念标了 🔊 的那一行。
@@ -387,6 +395,16 @@ def handle_hook(cfg):
 
     if event == "UserPromptSubmit":
         stop_speaking(session)   # 你一开口，只掐这个会话的
+        prompt = payload.get("prompt") or ""
+        if QUIET_RE.search(prompt):
+            import time
+            stop_speaking(None)  # 明确让闭嘴：所有会话全停
+            try:
+                with open(MUTE_PATH, "w") as f:
+                    json.dump({"session": session, "ts": time.time()}, f)
+            except Exception:
+                pass
+            log("quiet: 全局停，且下一条回复静音")
         return
 
     if event == "Notification":
@@ -397,9 +415,19 @@ def handle_hook(cfg):
     if event in ("Stop", "SubagentStop"):
         if event == "SubagentStop":
             return               # 子 agent 不念，太吵
+        import time
+        # 刚被喊过"闭嘴"：这一条确认回复不念，念了等于没闭
+        try:
+            with open(MUTE_PATH) as f:
+                mute = json.load(f)
+            if mute.get("session") == session and time.time() - mute.get("ts", 0) < 600:
+                os.remove(MUTE_PATH)
+                log("Stop: 静音生效，这条不念")
+                return
+        except Exception:
+            pass
         # Stop hook 和 transcript 落盘是同一瞬间的竞态：hook 经常先跑，
         # 这时最终回复那一行还没写进文件，解析出来是空的。空了就等一下再读。
-        import time
         tp = payload.get("transcript_path", "")
         raw = ""
         for attempt in range(6):
