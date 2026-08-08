@@ -307,16 +307,24 @@ def truncate_for_speech(text, limit):
 # 从 transcript 里取出这一轮的最终回复
 # --------------------------------------------------------------------------
 
-def last_assistant_text(transcript_path):
+def turn_texts(transcript_path):
+    """返回 (最终段文字, 整个回合的全部文字)。
+
+    最终段 = 最后一次工具调用之后的文字。但 🔊 标记不能只在这里找：
+    并行会话里的模型有时把 🔊 写在回合中间的消息里，最后一条长消息
+    反而没带标记——只看最终段就会漏掉，退化成全文朗读。所以把整个
+    回合（上一条真实用户消息之后）的文字也收回来，给找标记用。
+    """
     if not transcript_path or not os.path.exists(transcript_path):
-        return ""
+        return "", ""
     try:
         with open(transcript_path, encoding="utf-8", errors="replace") as f:
             lines = deque(f, maxlen=3000)
     except Exception:
-        return ""
+        return "", ""
 
-    chunks = []
+    final_chunks, all_chunks = [], []
+    passed_tool = False
     for raw in reversed(lines):
         raw = raw.strip()
         if not raw:
@@ -328,16 +336,22 @@ def last_assistant_text(transcript_path):
 
         etype = entry.get("type")
         if etype == "user":
-            break            # 到上一轮了，停
+            content = entry.get("message", {}).get("content")
+            # tool_result 也是 user 条目，不是真人说话，跳过继续往前找
+            if isinstance(content, list) and any(
+                isinstance(c, dict) and c.get("type") == "tool_result" for c in content
+            ):
+                continue
+            break            # 真实用户消息：回合边界
         if etype != "assistant":
             continue
 
         content = entry.get("message", {}).get("content", [])
         if not isinstance(content, list):
             continue
-        # 带 tool_use 的那条是干活途中的旁白，最终回复到此为止
         if any(isinstance(c, dict) and c.get("type") == "tool_use" for c in content):
-            break
+            passed_tool = True
+            continue
 
         text = "".join(
             c.get("text", "")
@@ -345,10 +359,13 @@ def last_assistant_text(transcript_path):
             if isinstance(c, dict) and c.get("type") == "text"
         )
         if text.strip():
-            chunks.append(text)
+            all_chunks.append(text)
+            if not passed_tool:
+                final_chunks.append(text)
 
-    chunks.reverse()
-    return "\n".join(chunks)
+    final_chunks.reverse()
+    all_chunks.reverse()
+    return "\n".join(final_chunks), "\n".join(all_chunks)
 
 
 # --------------------------------------------------------------------------
@@ -474,21 +491,29 @@ def handle_hook(cfg):
         # Stop hook 和 transcript 落盘是同一瞬间的竞态：hook 经常先跑，
         # 这时最终回复那一行还没写进文件，解析出来是空的。空了就等一下再读。
         tp = payload.get("transcript_path", "")
-        raw = ""
+        final = whole = ""
         for attempt in range(6):
-            raw = last_assistant_text(tp)
-            if raw.strip():
+            final, whole = turn_texts(tp)
+            if final.strip():
                 if attempt:
                     log(f"Stop: 第 {attempt + 1} 次才读到（落盘竞态）")
                 break
             time.sleep(0.15)
-        spoken = extract_spoken(raw)
+        # 优先最终段里的 🔊；没有就退到整个回合里最后出现的 🔊 行
+        spoken = extract_spoken(final)
+        if not spoken:
+            hits = SPOKEN_RE.findall(whole)
+            spoken = hits[-1].strip() if hits else ""
+            if spoken:
+                log("Stop: 最终段无标记，用回合中间的 🔊 行")
         if spoken:
-            log(f"Stop: 用 🔊 摘要 {len(spoken)} 字（全文 {len(raw)} 字）")
+            log(f"Stop: 念 🔊 摘要 {len(spoken)} 字（最终段 {len(final)} 字）")
             text = truncate_for_speech(clean_for_speech(spoken), int(cfg["max_chars"]))
         else:
-            log(f"Stop: 无 🔊 标记，念全文 {len(raw)} 字")
-            text = truncate_for_speech(clean_for_speech(raw), int(cfg["max_chars"]))
+            # 整个回合都没标记：只念开头两句。念全文对听觉是灾难，
+            # 并行会话里不守 🔊 约定的回复动辄七八百字。
+            text = truncate_for_speech(clean_for_speech(final), 100)
+            log(f"Stop: 无 🔊 标记，只念开头（全文 {len(final)} 字）")
         speak(text, cfg, session, label)
         return
 
