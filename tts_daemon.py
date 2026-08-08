@@ -58,10 +58,17 @@ def log(msg):
         pass
 
 
+MOSS_MODEL = "mlx-community/MOSS-TTS-Nano-100M"
+MOSS_REF = os.path.join(HOME, ".claude", "voice_ref.wav")
+
+
 def load_config():
     cfg = {"model": DEFAULT_MODEL, "kokoro_voice": DEFAULT_VOICE,
            "speed": DEFAULT_SPEED, "lang_code": DEFAULT_LANG,
-           "announce_session": True}
+           "announce_session": True,
+           # tts_model: kokoro（预置音色）或 moss（用 voice_ref.wav 克隆音色）
+           "tts_model": "kokoro",
+           "moss_ref_audio": MOSS_REF}
     try:
         with open(CONFIG_PATH) as f:
             cfg.update({k: v for k, v in json.load(f).items() if k in cfg})
@@ -141,8 +148,13 @@ class Engine:
         warnings.filterwarnings("ignore")          # jieba/torch 一堆噪音
         logging.getLogger("jieba").setLevel(logging.ERROR)
         from mlx_audio.tts.utils import load_model
-        self.model = load_model(self.cfg["model"])
-        log(f"模型加载完成 {self.cfg['model']} 耗时 {time.time() - t0:.1f}s")
+        # 选 moss 但参考音频不存在时退回 kokoro——克隆模型没有参考就没有声音
+        if self.cfg["tts_model"] == "moss" and not os.path.exists(self.cfg["moss_ref_audio"]):
+            log(f"moss 参考音频不存在 {self.cfg['moss_ref_audio']}，退回 kokoro")
+            self.cfg["tts_model"] = "kokoro"
+        model_id = MOSS_MODEL if self.cfg["tts_model"] == "moss" else self.cfg["model"]
+        self.model = load_model(model_id)
+        log(f"模型加载完成 {model_id} 耗时 {time.time() - t0:.1f}s")
         # 冷启动第一次要下载音色文件、建 jieba 词典，约 7 秒。
         # 在这里先跑一次，别让用户的第一句话吃到这个延迟。
         try:
@@ -160,8 +172,8 @@ class Engine:
         支持英文回调，挂上英文 G2P 就能正常发音。需要 spacy 的
         en_core_web_sm——注意不能让 spacy 自己去下载，它会调 uv 然后
         把整个进程带崩，必须预先装好。"""
-        if self.cfg["lang_code"] != "z":
-            return
+        if self.cfg["tts_model"] != "kokoro" or self.cfg["lang_code"] != "z":
+            return                        # moss 是 LM 模型，混排天生没问题
         try:
             from misaki import zh, en
             eng = en.G2P(trf=False, british=False, fallback=None, unk="")
@@ -177,20 +189,31 @@ class Engine:
     def _synth(self, text):
         """返回 float32 numpy 波形。不同模型返回结构不一样，这里做兼容。"""
         import numpy as np
-        kwargs = dict(text=text, voice=self.cfg["kokoro_voice"],
-                      speed=self.cfg["speed"], lang_code=self.cfg["lang_code"])
-        try:
-            results = list(self.model.generate(**kwargs))
-        except TypeError:      # 别的模型可能不认 lang_code / speed
-            results = list(self.model.generate(text=text, voice=self.cfg["kokoro_voice"]))
+        if self.cfg["tts_model"] == "moss":
+            results = list(self.model.generate(text=text,
+                                               ref_audio=self.cfg["moss_ref_audio"]))
+        else:
+            kwargs = dict(text=text, voice=self.cfg["kokoro_voice"],
+                          speed=self.cfg["speed"], lang_code=self.cfg["lang_code"])
+            try:
+                results = list(self.model.generate(**kwargs))
+            except TypeError:  # 别的模型可能不认 lang_code / speed
+                results = list(self.model.generate(text=text, voice=self.cfg["kokoro_voice"]))
         if not results:
             return None
-        seg = results[0]
-        audio = getattr(seg, "audio", seg)
-        sr = getattr(seg, "sample_rate", None)
+        sr = getattr(results[0], "sample_rate", None)
         if sr:
             self.sample_rate = int(sr)
-        wav = np.asarray(audio, dtype="float32").reshape(-1)
+        parts = []
+        for seg in results:
+            audio = np.asarray(getattr(seg, "audio", seg), dtype="float32")
+            if audio.ndim == 2:
+                # MOSS 输出 48kHz 立体声 (N, 2)。直接 reshape(-1) 会把左右声道
+                # 交错摊平成双倍长度的"单声道"——听感就是半速播放加严重扭曲。
+                # 必须先混成单声道。
+                audio = audio.mean(axis=-1) if audio.shape[-1] <= 2 else audio.mean(axis=0)
+            parts.append(audio.reshape(-1))
+        wav = np.concatenate(parts) if len(parts) > 1 else parts[0]
         peak = float(abs(wav).max()) if len(wav) else 0.0
         if peak > 1e-6:
             wav = wav * (TARGET_PEAK / peak)
@@ -423,8 +446,12 @@ def serve():
             req = json.loads(data) if data else {}
             cmd = req.get("cmd")
             if cmd == "ping":
+                if cfg["tts_model"] == "moss":
+                    model_id, voice = MOSS_MODEL, cfg["moss_ref_audio"]
+                else:
+                    model_id, voice = cfg["model"], cfg["kokoro_voice"]
                 conn.sendall(json.dumps({
-                    "ok": True, "model": cfg["model"], "voice": cfg["kokoro_voice"],
+                    "ok": True, "model": model_id, "voice": voice,
                     "queue": engine.utt_q.qsize(),
                 }).encode())
             elif cmd == "stop":

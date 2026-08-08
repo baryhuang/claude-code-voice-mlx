@@ -156,8 +156,10 @@ Uninstall: `python3 install.py --uninstall`.
 {
   "enabled": true,
   "engine": "kokoro",
+  "tts_model": "kokoro",
   "model": "mlx-community/Kokoro-82M-bf16",
   "kokoro_voice": "zf_xiaoxiao",
+  "moss_ref_audio": "~/.claude/voice_ref.wav",
   "speed": 1.0,
   "max_chars": 700,
   "announce_session": true,
@@ -166,6 +168,17 @@ Uninstall: `python3 install.py --uninstall`.
   "speak_notifications": true
 }
 ```
+
+`tts_model: "moss"` switches the daemon to
+[MOSS-TTS-Nano-100M](https://huggingface.co/mlx-community/MOSS-TTS-Nano-100M)
+(OpenMOSS, 2026), a voice-cloning model: it speaks in whatever voice you put at
+`moss_ref_audio` (5–10 s of clean single-speaker audio; this is how you get an
+accent no preset ships, e.g. Taiwanese Mandarin). Native mixed Chinese–English,
+48 kHz, ~9× real time on an M3 Pro. Note its output is **stereo** `(N, 2)` —
+flattening it naively interleaves the channels and plays at half speed,
+distorted; the daemon downmixes to mono. If the reference file is missing the
+daemon falls back to Kokoro. Kokoro remains the default: 24 kHz mono, preset
+voices, slightly faster.
 
 `engine: "say"` bypasses the daemon entirely. Replies longer than `max_chars`
 are truncated at a sentence boundary with a spoken notice.
