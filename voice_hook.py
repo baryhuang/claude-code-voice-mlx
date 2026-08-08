@@ -54,11 +54,10 @@ DAEMON_PY = os.path.join(HOME, ".claude", "hooks", "tts_daemon.py")
 
 DEFAULTS = {
     "enabled": True,
-    # say = 系统自带，难听但零依赖；kokoro = MLX 神经网络模型，好听但要常驻进程
-    "engine": "kokoro",
-    "model": "mlx-community/Kokoro-82M-bf16",
-    "kokoro_voice": "zf_xiaobei",
-    "speed": 1.0,
+    # moss = MLX 上的克隆模型（声音来自 voice_ref.wav），要常驻进程；
+    # say = 系统自带兜底，难听但零依赖
+    "engine": "moss",
+    "moss_ref_audio": "~/.claude/voice_ref.wav",
     # 收到指令先应一声——免屏场景下没有回执，用户不知道你听没听见。
     # 应答会复述指令的头一小句（"收到，跑一遍测试"），顺带让用户
     # 听出语音识别有没有错，比干巴巴一句"开始了"有用。
@@ -95,7 +94,7 @@ def save_config(cfg):
 
 
 # --------------------------------------------------------------------------
-# Kokoro 常驻服务（跑在 ~/.claude/voice-tts 那个 3.12 环境里）
+# TTS 常驻服务（跑在 ~/.claude/voice-tts 那个 3.12 环境里）
 # --------------------------------------------------------------------------
 
 def daemon_request(payload, timeout=1.5):
@@ -170,15 +169,15 @@ def speak(text, cfg, session=None, label=None):
         log("speak: 文本为空，跳过")
         return
 
-    if cfg.get("engine") == "kokoro":
+    if cfg.get("engine") == "moss":
         resp = daemon_request({"cmd": "speak", "text": text,
                                "session": session, "label": label})
         if resp:
-            log(f"speak: 交给 kokoro，{len(text)} 字，队列深度 {resp.get('queue')}")
+            log(f"speak: 交给 moss，{len(text)} 字，队列深度 {resp.get('queue')}")
             return
         # 服务没起来：拉起它，但这一句先用 say 兜底，别让用户干等
         daemon_spawn()
-        log("speak: kokoro 未就绪，本句降级到 say")
+        log("speak: moss 未就绪，本句降级到 say")
 
     stop_speaking()
     cmd = ["/usr/bin/say", "-v", str(cfg["voice"]), "-r", str(cfg["rate"]), text]

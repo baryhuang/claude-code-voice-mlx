@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Kokoro TTS 常驻服务。
+"""TTS 常驻服务（MOSS-TTS-Nano 声音克隆）。
 
 为什么要常驻：模型加载要好几秒，每次念之前现加载比 say 还难受。
 所以模型一直待在内存里，hook 只通过 unix socket 丢一句文字过来。
@@ -36,11 +36,9 @@ CONFIG_PATH = os.path.join(HOME, ".claude", "voice_config.json")
 STATUS_PATH = os.path.join(HOME, ".claude", ".voice_status.json")
 NOTCH_BIN = os.path.join(HOME, ".claude", "hooks", "voice-notch")
 
-DEFAULT_MODEL = "mlx-community/Kokoro-82M-bf16"
-DEFAULT_VOICE = "zf_xiaoxiao"
-DEFAULT_SPEED = 1.0
-DEFAULT_LANG = "z"          # Kokoro 的中文语种码，不传会去加载英文 g2p 然后报错
-TARGET_PEAK = 0.9           # Kokoro 输出峰值只有 0.3 左右，比 say 明显轻，要拉齐
+DEFAULT_MODEL = "mlx-community/MOSS-TTS-Nano-100M"
+DEFAULT_REF = os.path.join(HOME, ".claude", "voice_ref.wav")
+TARGET_PEAK = 0.9           # 模型输出峰值偏低，比 say 明显轻，统一拉齐
 
 MAX_LOG = 256 * 1024
 
@@ -58,22 +56,16 @@ def log(msg):
         pass
 
 
-MOSS_MODEL = "mlx-community/MOSS-TTS-Nano-100M"
-MOSS_REF = os.path.join(HOME, ".claude", "voice_ref.wav")
-
-
 def load_config():
-    cfg = {"model": DEFAULT_MODEL, "kokoro_voice": DEFAULT_VOICE,
-           "speed": DEFAULT_SPEED, "lang_code": DEFAULT_LANG,
-           "announce_session": True,
-           # tts_model: kokoro（预置音色）或 moss（用 voice_ref.wav 克隆音色）
-           "tts_model": "kokoro",
-           "moss_ref_audio": MOSS_REF}
+    cfg = {"model": DEFAULT_MODEL,
+           "moss_ref_audio": DEFAULT_REF,      # 克隆参考音频：声音由它决定
+           "announce_session": True}
     try:
         with open(CONFIG_PATH) as f:
             cfg.update({k: v for k, v in json.load(f).items() if k in cfg})
     except Exception:
         pass
+    cfg["moss_ref_audio"] = os.path.expanduser(cfg["moss_ref_audio"])
     return cfg
 
 
@@ -144,61 +136,28 @@ class Engine:
     # -- 模型 ------------------------------------------------------------
     def load(self):
         t0 = time.time()
-        import warnings, logging
-        warnings.filterwarnings("ignore")          # jieba/torch 一堆噪音
-        logging.getLogger("jieba").setLevel(logging.ERROR)
+        import warnings
+        warnings.filterwarnings("ignore")
+        # 克隆模型没有参考音频就没有声音，起不来就明确退出，
+        # hook 那边探测不到 socket 会自动降级到 say
+        if not os.path.exists(self.cfg["moss_ref_audio"]):
+            log(f"参考音频不存在 {self.cfg['moss_ref_audio']}，退出（hook 会用 say 兜底）")
+            sys.exit(1)
         from mlx_audio.tts.utils import load_model
-        # 选 moss 但参考音频不存在时退回 kokoro——克隆模型没有参考就没有声音
-        if self.cfg["tts_model"] == "moss" and not os.path.exists(self.cfg["moss_ref_audio"]):
-            log(f"moss 参考音频不存在 {self.cfg['moss_ref_audio']}，退回 kokoro")
-            self.cfg["tts_model"] = "kokoro"
-        model_id = MOSS_MODEL if self.cfg["tts_model"] == "moss" else self.cfg["model"]
-        self.model = load_model(model_id)
-        log(f"模型加载完成 {model_id} 耗时 {time.time() - t0:.1f}s")
-        # 冷启动第一次要下载音色文件、建 jieba 词典，约 7 秒。
-        # 在这里先跑一次，别让用户的第一句话吃到这个延迟。
+        self.model = load_model(self.cfg["model"])
+        log(f"模型加载完成 {self.cfg['model']} 耗时 {time.time() - t0:.1f}s")
+        # 首次合成要下载 tokenizer、做冷编译，在这里吃掉这个延迟
         try:
             self._synth("预热")
             log(f"预热完成，累计 {time.time() - t0:.1f}s，可以接活了")
         except Exception as e:
             log(f"预热失败 {e!r}")
-        self._patch_english()
-
-    def _patch_english(self):
-        """给中文管线挂上英文回调。
-
-        mlx-audio 建 ZHG2P 时不传 en_callable，混在中文里的英文单词
-        （GitHub、pytest 这类）会被中文字音转换硬啃成乱音。misaki 本身
-        支持英文回调，挂上英文 G2P 就能正常发音。需要 spacy 的
-        en_core_web_sm——注意不能让 spacy 自己去下载，它会调 uv 然后
-        把整个进程带崩，必须预先装好。"""
-        if self.cfg["tts_model"] != "kokoro" or self.cfg["lang_code"] != "z":
-            return                        # moss 是 LM 模型，混排天生没问题
-        try:
-            from misaki import zh, en
-            eng = en.G2P(trf=False, british=False, fallback=None, unk="")
-            pipe = self.model._pipelines.get("z")
-            if pipe is None:
-                log("英文回调：z 管线不存在，跳过")
-                return
-            pipe.g2p = zh.ZHG2P(en_callable=lambda t: eng(t)[0])
-            log("英文回调已挂上，中英混排可用")
-        except Exception as e:
-            log(f"英文回调挂载失败（混排里的英文会难听，但不影响中文）: {e!r}")
 
     def _synth(self, text):
-        """返回 float32 numpy 波形。不同模型返回结构不一样，这里做兼容。"""
+        """返回 float32 numpy 单声道波形。"""
         import numpy as np
-        if self.cfg["tts_model"] == "moss":
-            results = list(self.model.generate(text=text,
-                                               ref_audio=self.cfg["moss_ref_audio"]))
-        else:
-            kwargs = dict(text=text, voice=self.cfg["kokoro_voice"],
-                          speed=self.cfg["speed"], lang_code=self.cfg["lang_code"])
-            try:
-                results = list(self.model.generate(**kwargs))
-            except TypeError:  # 别的模型可能不认 lang_code / speed
-                results = list(self.model.generate(text=text, voice=self.cfg["kokoro_voice"]))
+        results = list(self.model.generate(text=text,
+                                           ref_audio=self.cfg["moss_ref_audio"]))
         if not results:
             return None
         sr = getattr(results[0], "sample_rate", None)
@@ -208,7 +167,7 @@ class Engine:
         for seg in results:
             audio = np.asarray(getattr(seg, "audio", seg), dtype="float32")
             if audio.ndim == 2:
-                # MOSS 输出 48kHz 立体声 (N, 2)。直接 reshape(-1) 会把左右声道
+                # 模型输出 48kHz 立体声 (N, 2)。直接 reshape(-1) 会把左右声道
                 # 交错摊平成双倍长度的"单声道"——听感就是半速播放加严重扭曲。
                 # 必须先混成单声道。
                 audio = audio.mean(axis=-1) if audio.shape[-1] <= 2 else audio.mean(axis=0)
@@ -446,12 +405,8 @@ def serve():
             req = json.loads(data) if data else {}
             cmd = req.get("cmd")
             if cmd == "ping":
-                if cfg["tts_model"] == "moss":
-                    model_id, voice = MOSS_MODEL, cfg["moss_ref_audio"]
-                else:
-                    model_id, voice = cfg["model"], cfg["kokoro_voice"]
                 conn.sendall(json.dumps({
-                    "ok": True, "model": model_id, "voice": voice,
+                    "ok": True, "model": cfg["model"], "voice": cfg["moss_ref_audio"],
                     "queue": engine.utt_q.qsize(),
                 }).encode())
             elif cmd == "stop":
