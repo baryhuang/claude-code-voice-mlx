@@ -155,7 +155,7 @@ live — no restart needed. Uninstall with `python3 install.py --uninstall`.
 | --- | --- |
 | `Stop` | Reply finished → extract the `🔊` line → enqueue for playback |
 | `Notification` | "needs your permission to use Bash" → spoken, so no blind waiting |
-| `UserPromptSubmit` | Cancels that session's audio only |
+| `UserPromptSubmit` | Cancels that session's audio, then acknowledges: **"收到，跑一遍测试"** — echoing the head of your command back, which doubles as a speech-recognition check. Quiet phrases ("闭嘴", "stop talking") skip the current utterance instead; the rest of the queue keeps playing |
 
 ---
 

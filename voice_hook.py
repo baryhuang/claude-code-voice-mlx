@@ -59,6 +59,11 @@ DEFAULTS = {
     "model": "mlx-community/Kokoro-82M-bf16",
     "kokoro_voice": "zf_xiaobei",
     "speed": 1.0,
+    # 收到指令先应一声——免屏场景下没有回执，用户不知道你听没听见。
+    # 应答会复述指令的头一小句（"收到，跑一遍测试"），顺带让用户
+    # 听出语音识别有没有错，比干巴巴一句"开始了"有用。
+    "ack_on_prompt": True,
+    "ack_prefix": "收到",
     # 注意：say -v '?' 会列出一堆语音包没下载的声音（Sandy/Eddy/Flo/Reed/Rocko...），
     # 它们不报错，只是输出静音。实测真能发声的中文声音只有这三个：
     # Tingting(普通话) / Meijia(台湾) / Sinji(粤语)。用 --test 会自动查。
@@ -263,6 +268,20 @@ def extract_spoken(raw):
     return " ".join(h for h in hits if h)
 
 
+def ack_text_for(prompt, cfg):
+    """把指令的头一小句复述回去当回执。整段念一遍太吵，只要开头。"""
+    p = clean_for_speech(prompt)
+    p = re.sub(r"\s+", " ", p).strip()
+    for i, ch in enumerate(p):
+        if ch in "。！？!?，,；;" and i >= 4:
+            p = p[:i]
+            break
+    if len(p) > 24:
+        p = p[:24]
+    prefix = cfg.get("ack_prefix", "收到")
+    return f"{prefix}，{p}" if p else prefix
+
+
 def truncate_for_speech(text, limit):
     if len(text) <= limit:
         return text
@@ -407,6 +426,19 @@ def handle_hook(cfg):
             except Exception:
                 pass
             log("quiet: 跳过当前段，队列继续，下一条回复静音")
+            return
+        # 正常指令：清掉可能残留的静音标记——静音只该管"闭嘴"那一条的回执，
+        # 不该把下一个正经任务的汇报也吞掉
+        try:
+            with open(MUTE_PATH) as f:
+                stale = json.load(f)
+            if stale.get("session") == session:
+                os.remove(MUTE_PATH)
+        except Exception:
+            pass
+        # 斜杠命令是键盘操作，不需要语音回执
+        if cfg.get("ack_on_prompt", True) and not prompt.lstrip().startswith("/"):
+            speak(ack_text_for(prompt, cfg), cfg, session, label)
         return
 
     if event == "Notification":
