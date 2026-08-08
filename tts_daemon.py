@@ -150,6 +150,29 @@ class Engine:
             log(f"预热完成，累计 {time.time() - t0:.1f}s，可以接活了")
         except Exception as e:
             log(f"预热失败 {e!r}")
+        self._patch_english()
+
+    def _patch_english(self):
+        """给中文管线挂上英文回调。
+
+        mlx-audio 建 ZHG2P 时不传 en_callable，混在中文里的英文单词
+        （GitHub、pytest 这类）会被中文字音转换硬啃成乱音。misaki 本身
+        支持英文回调，挂上英文 G2P 就能正常发音。需要 spacy 的
+        en_core_web_sm——注意不能让 spacy 自己去下载，它会调 uv 然后
+        把整个进程带崩，必须预先装好。"""
+        if self.cfg["lang_code"] != "z":
+            return
+        try:
+            from misaki import zh, en
+            eng = en.G2P(trf=False, british=False, fallback=None, unk="")
+            pipe = self.model._pipelines.get("z")
+            if pipe is None:
+                log("英文回调：z 管线不存在，跳过")
+                return
+            pipe.g2p = zh.ZHG2P(en_callable=lambda t: eng(t)[0])
+            log("英文回调已挂上，中英混排可用")
+        except Exception as e:
+            log(f"英文回调挂载失败（混排里的英文会难听，但不影响中文）: {e!r}")
 
     def _synth(self, text):
         """返回 float32 numpy 波形。不同模型返回结构不一样，这里做兼容。"""

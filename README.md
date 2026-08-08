@@ -121,7 +121,8 @@ cd claude-code-voice-mlx
 
 uv venv ~/.claude/voice-tts --python 3.12
 uv pip install --python ~/.claude/voice-tts/bin/python \
-    mlx-audio soundfile "misaki[zh,en]"
+    mlx-audio soundfile "misaki[zh,en]" \
+    "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl"
 
 python3 install.py
 ~/.claude/hooks/voice_hook.py --test
@@ -234,6 +235,16 @@ Settings → Accessibility → Spoken Content → System Voice → Manage Voices
 Chinese synthesis needs the `misaki[zh]` grapheme-to-phoneme package, and
 calls must pass `lang_code="z"` explicitly; otherwise Kokoro loads the
 English g2p and raises.
+
+### English words inside Chinese sentences sound garbled
+
+mlx-audio constructs the Chinese G2P without an English callback, so embedded
+English ("GitHub", "pytest") is mangled by the Chinese converter. The daemon
+patches the pipeline after warmup: `ZHG2P(en_callable=...)` wired to the
+English G2P. This requires spacy's `en_core_web_sm` to be installed **ahead of
+time** (included in the install command above) — if spacy tries to download it
+at first use, its installer subprocess fails inside a uv-managed venv and
+takes the daemon down with it.
 
 ### Nothing spoken at end of turn (intermittent)
 
