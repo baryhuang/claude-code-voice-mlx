@@ -14,6 +14,10 @@ synthesis at 10–18× real time, ~200 MB resident memory.
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.12-blue?logo=python&logoColor=white)
 
+**Listen:** [demo/queue_demo.m4a](demo/queue_demo.m4a) — three utterances from
+two sessions played through the queue, project name announced on speaker change
+(12 s).
+
 ---
 
 ## Architecture
