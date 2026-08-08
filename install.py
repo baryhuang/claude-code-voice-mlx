@@ -20,6 +20,9 @@ INSTALLED = os.path.join(HOME, ".claude", "hooks", "voice_hook.py")
 # 常驻服务同理
 DAEMON_SOURCE = os.path.join(HERE, "tts_daemon.py")
 DAEMON_INSTALLED = os.path.join(HOME, ".claude", "hooks", "tts_daemon.py")
+# 刘海状态条（可选，需要 Xcode 的 swiftc）
+NOTCH_SOURCE = os.path.join(HERE, "VoiceNotch.swift")
+NOTCH_BIN = os.path.join(HOME, ".claude", "hooks", "voice-notch")
 COMMAND = f"/usr/bin/env python3 {INSTALLED}"
 
 # 老版本直接指向仓库里的脚本，升级时一并清掉
@@ -46,6 +49,27 @@ def copy_hook():
         if os.path.exists(src):
             shutil.copy2(src, dst)
             os.chmod(dst, 0o755)
+    build_notch()
+
+
+def build_notch():
+    """有 swiftc 就把刘海状态条编译出来；没有就跳过，纯语音照常工作。"""
+    import subprocess
+    if not os.path.exists(NOTCH_SOURCE):
+        return
+    if not shutil.which("swiftc"):
+        print("提示: 没找到 swiftc，跳过刘海状态条（装 Xcode 后重跑 install.py）")
+        return
+    src_m = os.path.getmtime(NOTCH_SOURCE)
+    if os.path.exists(NOTCH_BIN) and os.path.getmtime(NOTCH_BIN) >= src_m:
+        return                                      # 没改过源码，不用重编
+    print("编译刘海状态条 …")
+    r = subprocess.run(["swiftc", "-O", NOTCH_SOURCE, "-o", NOTCH_BIN],
+                       capture_output=True, text=True)
+    if r.returncode == 0:
+        print(f"已生成 {NOTCH_BIN}")
+    else:
+        print(f"编译失败（不影响语音）:\n{r.stderr[:800]}")
 
 
 def strip_commands(settings, targets):

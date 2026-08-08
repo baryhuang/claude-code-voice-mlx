@@ -33,6 +33,8 @@ HOME = os.path.expanduser("~")
 SOCK_PATH = os.path.join(HOME, ".claude", ".voice_tts.sock")
 LOG_PATH = os.path.join(HOME, ".claude", "voice_tts_daemon.log")
 CONFIG_PATH = os.path.join(HOME, ".claude", "voice_config.json")
+STATUS_PATH = os.path.join(HOME, ".claude", ".voice_status.json")
+NOTCH_BIN = os.path.join(HOME, ".claude", "hooks", "voice-notch")
 
 DEFAULT_MODEL = "mlx-community/Kokoro-82M-bf16"
 DEFAULT_VOICE = "zf_xiaoxiao"
@@ -122,6 +124,8 @@ class Engine:
         self.lock = threading.Lock()
         self.next_id = 0
         self.utt_session = {}           # utt_id -> session，用来定向取消
+        self.utt_meta = {}              # utt_id -> (label, 文字开头)，给刘海状态条用
+        self.pending = []               # 排队顺序（含正在播的），驱动状态显示
         self.cancelled = set()
         self.player = None
         self.playing_utt = None
@@ -169,6 +173,28 @@ class Engine:
             wav = wav * (TARGET_PEAK / peak)
         return wav
 
+    # -- 状态文件：给刘海上的 voice-notch 看的 ----------------------------
+    def write_status(self):
+        try:
+            with self.lock:
+                cur = self.playing_utt
+                speaking = None
+                if cur is not None and cur in self.utt_meta:
+                    lbl, txt = self.utt_meta[cur]
+                    speaking = {"label": lbl or "", "text": txt}
+                waiting = [
+                    {"label": (self.utt_meta.get(u) or ("", ""))[0]}
+                    for u in self.pending
+                    if u != cur and u not in self.cancelled
+                ]
+            tmp = STATUS_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"speaking": speaking, "queue": waiting, "ts": time.time()}, f,
+                          ensure_ascii=False)
+            os.replace(tmp, STATUS_PATH)   # 原子替换，读的一方永远看不到半截 JSON
+        except Exception as e:
+            log(f"写状态失败 {e!r}")
+
     # -- 入队 ------------------------------------------------------------
     def enqueue(self, text, session, label):
         """排到队尾。不打断正在说的那句——多会话时那样会变成一堆半截话。"""
@@ -179,9 +205,12 @@ class Engine:
             self.next_id += 1
             utt_id = self.next_id
             self.utt_session[utt_id] = session
+            self.utt_meta[utt_id] = (label or "", text[:24])
+            self.pending.append(utt_id)
         self.utt_q.put((utt_id, session, label, text))
         depth = self.utt_q.qsize()
         log(f"入队 #{utt_id} [{label}] {len(text)}字，队列深度 {depth}")
+        self.write_status()
         return depth
 
     def stop(self, session=None):
@@ -204,6 +233,7 @@ class Engine:
                 pass
         if victims:
             log(f"取消 {len(victims)} 段（session={session or '全部'}）")
+            self.write_status()
 
     def _is_dead(self, utt_id):
         with self.lock:
@@ -215,12 +245,15 @@ class Engine:
             utt_id, session, label, text = self.utt_q.get()
             if self._is_dead(utt_id):
                 self._forget(utt_id)
+                self._finish_playback(utt_id)
                 continue
             try:
                 self._synth_utterance(utt_id, session, label, text)
             except Exception as e:
                 log(f"合成整段失败 #{utt_id} {e!r}")
             self._forget(utt_id)
+            # 哨兵：这一段的音频到此为止，播放线程见到它才知道该收尾
+            self.play_q.put((utt_id, None))
 
     def _synth_utterance(self, utt_id, session, label, text):
         chunks = split_sentences(text)
@@ -247,18 +280,33 @@ class Engine:
             self.play_q.put((utt_id, path))
 
     def _forget(self, utt_id):
+        """合成阶段结束。播放可能还在进行，meta 和 pending 留给播放线程清。"""
         with self.lock:
             self.utt_session.pop(utt_id, None)
+
+    def _finish_playback(self, utt_id):
+        with self.lock:
+            if utt_id in self.pending:
+                self.pending.remove(utt_id)
+            self.utt_meta.pop(utt_id, None)
             self.cancelled.discard(utt_id)
+        self.write_status()
 
     # -- 播放线程 --------------------------------------------------------
     def _play_loop(self):
         while True:
             utt_id, path = self.play_q.get()
+            if path is None:                    # 这一段播完了
+                if self.playing_utt == utt_id:
+                    self.playing_utt = None
+                self._finish_playback(utt_id)
+                continue
             if self._is_dead(utt_id):
                 self._rm(path)
                 continue
-            self.playing_utt = utt_id
+            if self.playing_utt != utt_id:      # 换人说话了，刷新刘海
+                self.playing_utt = utt_id
+                self.write_status()
             try:
                 self.player = subprocess.Popen(
                     ["/usr/bin/afplay", path],
@@ -269,7 +317,6 @@ class Engine:
                 log(f"播放失败 {e!r}")
             finally:
                 self.player = None
-                self.playing_utt = None
                 self._rm(path)
 
     @staticmethod
@@ -284,10 +331,28 @@ class Engine:
 # 服务
 # --------------------------------------------------------------------------
 
+def spawn_notch():
+    """把刘海状态条拉起来（如果编译过而且还没在跑）。"""
+    if not os.path.exists(NOTCH_BIN):
+        return
+    try:
+        alive = subprocess.run(["pgrep", "-x", "voice-notch"],
+                               capture_output=True, timeout=3).returncode == 0
+        if not alive:
+            subprocess.Popen([NOTCH_BIN], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+            log("刘海状态条已拉起")
+    except Exception as e:
+        log(f"拉起刘海状态条失败 {e!r}")
+
+
 def serve():
     cfg = load_config()
     engine = Engine(cfg)
     engine.load()
+    engine.write_status()      # 起来先写一份空状态，别让刘海读到上次的残留
+    spawn_notch()
 
     if os.path.exists(SOCK_PATH):
         os.remove(SOCK_PATH)

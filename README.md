@@ -79,6 +79,27 @@ Pipelining crosses utterance boundaries: the next session's audio is already
 synthesized and waiting when the current one finishes, so the queue introduces
 no gap.
 
+### Notch status display — see it, not just hear it
+
+Audio tells you what happened; it can't tell you *what's pending*. A
+Dynamic-Island-style pill fuses with the MacBook notch and shows the queue at a
+glance:
+
+```
+        ┌──────── notch ────────┐
+        │ 🔊 backend  tests pass… +2 │   ← who's speaking · snippet · queued count
+        └───────────────────────┘
+```
+
+- Appears only while something is speaking or queued; invisible otherwise
+- Fully click-through — it can never steal focus or block a menu
+- Native Swift/SwiftUI, compiled by `install.py` when `swiftc` is available;
+  skipped gracefully otherwise (audio works without it)
+- Reads a status file the daemon rewrites atomically on every state change —
+  no polling of the daemon itself
+
+The daemon launches it automatically. No Xcode project, one `.swift` file.
+
 ### Speak the summary, not the reply
 
 Listening is roughly 10× slower than reading. A reply that scans in five seconds
@@ -272,7 +293,8 @@ interactive use today.
 | --- | --- |
 | `voice_hook.py` | Hook entry point — transcript parsing, cleaning, session routing, `say` fallback |
 | `tts_daemon.py` | Resident Kokoro server — global queue, sentence pipelining, per-session cancel |
-| `install.py` | Copies both into `~/.claude/hooks/` and registers the hooks |
+| `VoiceNotch.swift` | Notch status pill — speaker, snippet, queue depth; click-through |
+| `install.py` | Copies into `~/.claude/hooks/`, compiles the notch pill, registers the hooks |
 
 Hooks are installed **into `~/.claude/hooks/`, not run from the clone** — a global
 hook should not break when a directory moves.
@@ -291,6 +313,9 @@ hook should not break when a directory moves.
 
 全局一个队列，一句说完再说下一句；换会话时先报项目名，同一个会话连着说就不报。
 打断也是分会话的——你在 A 会话开口，只掐 A 的语音，B 继续说完。
+
+刘海下面还有一条灵动岛式的状态条：谁在说话、说的什么开头、后面排着几段，
+一眼可见；没人说话就整个消失。纯 Swift 原生实现，点击完全穿透。
 
 引擎是 Kokoro 神经网络模型跑在苹果 MLX 上，**开口 0.3 秒，全程离线，不花钱**。
 
