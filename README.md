@@ -1,22 +1,31 @@
-# Voice Feedback for Claude Code + Codex (MLX)
+# Voice Feedback for Claude Code + Codex on Apple MLX
 
 **English** · [中文文档](#中文文档)
 
-**Claude Code and Codex talk on your Mac.** Text-to-speech output for both on
-macOS / Apple Silicon. Replies are synthesized locally on Apple MLX by
-MOSS-TTS-Nano, a 100M voice-cloning model — it speaks in the voice of any
-5–10 s reference clip you provide, which also covers accents no preset voice
-ships (e.g. Taiwanese Mandarin). Concurrent sessions share one playback queue:
-utterances play sequentially, the project name is announced when the speaking
-session changes, and cancelling one session's audio does not affect the others.
+![Claude Code and Codex voice feedback on Apple MLX](assets/social-preview.jpg)
 
-No network access is required after the initial model download.
-
-Measured on an M3 Pro (36 GB): first audio ~0.3 s after a reply completes,
-synthesis at ~9–11× real time, ~470 MB resident memory, ~280 MB on disk.
+**Give Claude Code and Codex a local cloned voice — and hear the right agent,
+in the right order.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.12-blue?logo=python&logoColor=white)
+![Platform](https://img.shields.io/badge/macOS-Apple_Silicon-black?logo=apple)
+![Claude Code](https://img.shields.io/badge/Claude_Code-hooks-d97757)
+![Codex](https://img.shields.io/badge/Codex-hooks-10a37f)
+
+MOSS-TTS-Nano runs locally on Apple MLX and clones any voice from a clean
+5–10 second recording. After the initial model download, speech stays offline.
+Concurrent Claude Code and Codex sessions share one ordered playback queue, so
+parallel agents never talk over one another.
+
+| What you get | Why it matters |
+| --- | --- |
+| **Claude Code + Codex hooks** | One voice system and one queue across both coding agents |
+| **Voice cloning** | Use your own voice, language, or accent instead of a preset voice |
+| **~0.3 s to first sound** | Hear the result immediately instead of waiting for the full reply |
+| **Session-aware FIFO** | Project names are announced on speaker changes; cancellation stays per session |
+| **MacBook notch status** | See who is speaking and how many utterances are queued |
+| **Local after download** | No speech API, API key, or per-character TTS bill |
 
 **Listen:** [demo/queue_demo.m4a](demo/queue_demo.m4a) — three utterances from
 two sessions played through the queue, project name announced on speaker change
@@ -26,6 +35,29 @@ two sessions played through the queue, project name announced on speaker change
 | --- | --- | --- |
 | Claude Code | `UserPromptSubmit`, `Notification`, `Stop` | `python3 install.py claude` |
 | Codex | `UserPromptSubmit`, `PermissionRequest`, `Stop` | `python3 install.py codex` |
+
+## Quick start
+
+Requires macOS on Apple Silicon, Python 3.12, `uv`, and `ffmpeg`.
+
+```bash
+git clone https://github.com/baryhuang/claude-codex-voice-mlx
+cd claude-codex-voice-mlx
+
+uv venv ~/.claude/voice-tts --python 3.12
+uv pip install --python ~/.claude/voice-tts/bin/python mlx-audio soundfile
+ffmpeg -i your_voice.mp3 -t 10 -ac 1 -ar 48000 -sample_fmt s16 ~/.claude/voice_ref.wav
+
+python3 install.py                    # Claude Code + Codex
+~/.claude/hooks/voice_hook.py --test
+```
+
+Then open Codex, run `/hooks` once, and trust the three new voice hooks. See
+[the detailed setup](#install-claude-code--codex) for per-client installation,
+configuration, and uninstall commands.
+
+If this makes parallel agent work easier, **star the repository** — it helps
+other Claude Code and Codex users find it.
 
 ---
 
@@ -154,8 +186,8 @@ Requires Apple Silicon and macOS. Python 3.13+ currently has no wheels for
 the dependencies; use 3.12.
 
 ```bash
-git clone https://github.com/baryhuang/claude-code-voice-mlx
-cd claude-code-voice-mlx
+git clone https://github.com/baryhuang/claude-codex-voice-mlx
+cd claude-codex-voice-mlx
 
 uv venv ~/.claude/voice-tts --python 3.12
 uv pip install --python ~/.claude/voice-tts/bin/python mlx-audio soundfile
@@ -372,7 +404,9 @@ audible as start-of-utterance delay, which defeats the ordered-queue design.
 
 # 中文文档
 
-**Claude Code + Codex 本地语音反馈。**
+![Claude Code 和 Codex 的 Apple MLX 本地语音反馈](assets/social-preview.jpg)
+
+**给 Claude Code 和 Codex 一个本地克隆声音，并让多个智能体按正确顺序开口。**
 
 **让 Claude Code 和 Codex 都在你的 Mac 上开口说话。** 回复由本地 Apple MLX 上运行的
 MOSS-TTS-Nano 合成播放——这是一个一亿参数的声音克隆模型，你给一段 5–10 秒的
@@ -392,6 +426,35 @@ MOSS-TTS-Nano 合成播放——这是一个一亿参数的声音克隆模型，
 | --- | --- | --- |
 | Claude Code | `UserPromptSubmit`、`Notification`、`Stop` | `python3 install.py claude` |
 | Codex | `UserPromptSubmit`、`PermissionRequest`、`Stop` | `python3 install.py codex` |
+
+| 能力 | 作用 |
+| --- | --- |
+| **Claude Code + Codex hooks** | 两个编码智能体共用一套语音系统和一个队列 |
+| **声音克隆** | 用自己的声音、语言和口音，不受预置音色限制 |
+| **约 0.3 秒出声** | 不必等整段回复合成完就能听到结果 |
+| **会话感知 FIFO** | 换会话时报项目名，取消语音只影响当前会话 |
+| **MacBook 刘海状态** | 一眼看到谁在说话、后面还有几段排队 |
+| **下载后本地运行** | 不需要语音 API、API key 或按字计费 |
+
+## 快速开始
+
+需要 Apple Silicon Mac、Python 3.12、`uv` 和 `ffmpeg`。
+
+```bash
+git clone https://github.com/baryhuang/claude-codex-voice-mlx
+cd claude-codex-voice-mlx
+
+uv venv ~/.claude/voice-tts --python 3.12
+uv pip install --python ~/.claude/voice-tts/bin/python mlx-audio soundfile
+ffmpeg -i 你的声音.mp3 -t 10 -ac 1 -ar 48000 -sample_fmt s16 ~/.claude/voice_ref.wav
+
+python3 install.py                    # Claude Code + Codex
+~/.claude/hooks/voice_hook.py --test
+```
+
+然后打开 Codex，输入一次 `/hooks`，信任三个新语音 hook。单独安装某个客户端、
+配置和卸载命令见[完整安装说明](#安装-claude-code--codex)。如果它让并行智能体更好用，
+欢迎给仓库一个 **Star**，这样其他 Claude Code 和 Codex 用户也更容易找到它。
 
 ## 架构
 
@@ -479,8 +542,8 @@ mtime。`install.py` 检测到 `swiftc` 就编译；没有也不影响语音。�
 需要 Apple Silicon 和 macOS。Python 3.13+ 目前没有依赖的 wheel，用 3.12。
 
 ```bash
-git clone https://github.com/baryhuang/claude-code-voice-mlx
-cd claude-code-voice-mlx
+git clone https://github.com/baryhuang/claude-codex-voice-mlx
+cd claude-codex-voice-mlx
 
 uv venv ~/.claude/voice-tts --python 3.12
 uv pip install --python ~/.claude/voice-tts/bin/python mlx-audio soundfile
