@@ -9,7 +9,10 @@ returns a JSON object because Codex Stop hooks require JSON on stdout.
 import json
 import sys
 
-import voice_hook
+try:
+    from . import voice_hook
+except ImportError:  # copied hooks run as standalone neighboring scripts
+    import voice_hook
 
 
 def main():

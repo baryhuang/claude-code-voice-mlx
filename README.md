@@ -24,17 +24,17 @@ two sessions played through the queue, project name announced on speaker change
 
 | Client | Lifecycle hooks | Installer |
 | --- | --- | --- |
-| Claude Code | `UserPromptSubmit`, `Notification`, `Stop` | `install.py` |
-| Codex | `UserPromptSubmit`, `PermissionRequest`, `Stop` | `install_codex.py` |
+| Claude Code | `UserPromptSubmit`, `Notification`, `Stop` | `python3 install.py claude` |
+| Codex | `UserPromptSubmit`, `PermissionRequest`, `Stop` | `python3 install.py codex` |
 
 ---
 
 ## Architecture
 
 ```
-Claude Code ──lifecycle hooks──▶ voice_hook.py ─┐
-                                               ├──unix socket──▶ tts_daemon.py ──afplay──▶ audio out
-Codex ──lifecycle hooks──▶ codex_voice_hook.py ─┘                       │
+Claude Code ──lifecycle hooks──▶ src/hooks/voice_hook.py ─┐
+                                                         ├──unix socket──▶ src/daemon/tts_daemon.py ──afplay──▶ audio out
+Codex ──lifecycle hooks──▶ src/hooks/codex_voice_hook.py ─┘                            │
                                                                        │ atomic write
                          fallback: /usr/bin/say                         ▼
                                                         ~/.claude/.voice_status.json
@@ -163,11 +163,10 @@ uv pip install --python ~/.claude/voice-tts/bin/python mlx-audio soundfile
 # the voice: any 5-10 s clean single-speaker recording
 ffmpeg -i your_voice.mp3 -t 10 -ac 1 -ar 48000 -sample_fmt s16 ~/.claude/voice_ref.wav
 
+# install the shared backend plus both Claude Code and Codex hooks
 python3 install.py
 ~/.claude/hooks/voice_hook.py --test
 
-# add Codex support using the same local voice backend and playback queue
-python3 install_codex.py
 codex
 # inside Codex, run /hooks once and trust the three voice hooks
 ```
@@ -182,7 +181,9 @@ run from `~/.claude/hooks/`, not from the clone, so moving or deleting the
 clone does not break them. Claude Code re-reads hook configuration per event;
 running sessions pick the hooks up without restart.
 
-Uninstall: `python3 install.py --uninstall`.
+Install only Claude Code: `python3 install.py claude`.
+
+Uninstall only Claude Code: `python3 install.py claude --uninstall`.
 
 ### 2. Codex
 
@@ -190,7 +191,7 @@ After the Claude voice backend above is working, register the equivalent
 Codex lifecycle hooks:
 
 ```bash
-python3 install_codex.py
+python3 install.py codex
 codex                 # then run /hooks and trust the three new hooks
 ```
 
@@ -198,7 +199,8 @@ The adapter writes `~/.codex/hooks.json` without replacing existing hooks and
 backs up an existing file as `hooks.json.bak`. It reuses the same MOSS model,
 reference clip, daemon, FIFO, configuration, and notch panel as Claude Code,
 so both clients share one ordered audio queue. Uninstall only the Codex
-adapter with `python3 install_codex.py --uninstall`.
+adapter with `python3 install.py codex --uninstall`. To remove both clients,
+run `python3 install.py --uninstall`.
 
 Codex `Stop` supplies `last_assistant_message` directly, avoiding the
 transcript-flush race. `PermissionRequest` is the Codex equivalent used for
@@ -344,16 +346,27 @@ audible as start-of-utterance delay, which defeats the ordered-queue design.
 
 ---
 
-## Files
+## Repository layout
 
-| File | Role |
-| --- | --- |
-| `voice_hook.py` | Hook entry: transcript parsing, cleaning, session routing, `say` fallback |
-| `tts_daemon.py` | Resident TTS server: FIFO queue, sentence pipelining, per-session cancel |
-| `VoiceNotch.swift` | Notch status panel |
-| `install.py` | Copy to `~/.claude/hooks/`, compile panel, register hooks |
-| `codex_voice_hook.py` | Codex JSON adapter for the shared voice hook |
-| `install_codex.py` | Preserve and update `~/.codex/hooks.json` |
+```text
+.
+├── install.py                    # unified installer: all / claude / codex
+├── installers/
+│   ├── install_claude.py         # ~/.claude/settings.json integration
+│   └── install_codex.py          # ~/.codex/hooks.json integration
+├── src/
+│   ├── hooks/
+│   │   ├── voice_hook.py         # shared behavior + Claude hook entry
+│   │   └── codex_voice_hook.py   # Codex JSON adapter
+│   ├── daemon/
+│   │   └── tts_daemon.py         # resident model, FIFO, synthesis, playback
+│   └── macos/
+│       └── VoiceNotch.swift      # notch status panel
+├── tests/
+│   └── test_codex_voice.py
+└── demo/
+    └── queue_demo.m4a
+```
 
 ---
 
@@ -377,15 +390,15 @@ MOSS-TTS-Nano 合成播放——这是一个一亿参数的声音克隆模型，
 
 | 客户端 | 生命周期 Hooks | 安装器 |
 | --- | --- | --- |
-| Claude Code | `UserPromptSubmit`、`Notification`、`Stop` | `install.py` |
-| Codex | `UserPromptSubmit`、`PermissionRequest`、`Stop` | `install_codex.py` |
+| Claude Code | `UserPromptSubmit`、`Notification`、`Stop` | `python3 install.py claude` |
+| Codex | `UserPromptSubmit`、`PermissionRequest`、`Stop` | `python3 install.py codex` |
 
 ## 架构
 
 ```
-Claude Code ──生命周期 hooks──▶ voice_hook.py ─┐
-                                               ├──unix socket──▶ tts_daemon.py ──afplay──▶ 声音输出
-Codex ──生命周期 hooks──▶ codex_voice_hook.py ─┘                       │
+Claude Code ──生命周期 hooks──▶ src/hooks/voice_hook.py ─┐
+                                                         ├──unix socket──▶ src/daemon/tts_daemon.py ──afplay──▶ 声音输出
+Codex ──生命周期 hooks──▶ src/hooks/codex_voice_hook.py ─┘                            │
                                                                        │ 原子写入
                            兜底: /usr/bin/say                           ▼
                                                         ~/.claude/.voice_status.json
@@ -475,11 +488,10 @@ uv pip install --python ~/.claude/voice-tts/bin/python mlx-audio soundfile
 # 声音：任何 5-10 秒干净的单人录音
 ffmpeg -i 你的声音.mp3 -t 10 -ac 1 -ar 48000 -sample_fmt s16 ~/.claude/voice_ref.wav
 
+# 安装共用后端、Claude Code hooks 和 Codex hooks
 python3 install.py
 ~/.claude/hooks/voice_hook.py --test
 
-# 使用同一个本地声音后端和播放队列，加入 Codex 支持
-python3 install_codex.py
 codex
 # 在 Codex 里输入一次 /hooks，信任三个语音 hook
 ```
@@ -491,21 +503,24 @@ codex
 保留，旧配置备份为 `.bak`。hook 从 `~/.claude/hooks/` 运行，不依赖 clone
 目录。Claude Code 每次事件都重读 hook 配置，运行中的会话无需重启。
 
-卸载：`python3 install.py --uninstall`。
+只安装 Claude Code：`python3 install.py claude`。
+
+只卸载 Claude Code：`python3 install.py claude --uninstall`。
 
 ### 2. Codex
 
 上面的 Claude 语音后端能工作后，注册对应的 Codex lifecycle hooks：
 
 ```bash
-python3 install_codex.py
+python3 install.py codex
 codex                 # 然后输入 /hooks，信任新加入的三个 hook
 ```
 
 安装器会保留 `~/.codex/hooks.json` 里已有的 hook，并把旧文件备份为
 `hooks.json.bak`。Codex 和 Claude Code 共用同一个 MOSS 模型、参考声音、
 常驻服务、FIFO 队列、配置和刘海面板，因此两边同时工作时仍然按一个队列播报。
-只卸载 Codex 适配器：`python3 install_codex.py --uninstall`。
+只卸载 Codex 适配器：`python3 install.py codex --uninstall`。两边一起卸载：
+`python3 install.py --uninstall`。
 
 Codex 的 `Stop` 直接提供 `last_assistant_message`，没有 transcript 落盘竞态；
 权限语音提醒使用 `PermissionRequest`。Codex 对新建或变更过的命令 hook 要求先
@@ -621,16 +636,27 @@ M3 Pro，36 GB，MOSS-TTS-Nano-100M，热启动：
 取舍标准：低于约 5 倍实时，队列积压会变成可听见的起播延迟，破坏顺序队列的
 设计初衷。
 
-## 文件
+## 目录结构
 
-| 文件 | 职责 |
-| --- | --- |
-| `voice_hook.py` | hook 入口：transcript 解析、清洗、会话路由、`say` 兜底 |
-| `tts_daemon.py` | 常驻合成服务：FIFO 队列、按句流水线、按会话取消 |
-| `VoiceNotch.swift` | 刘海状态面板 |
-| `install.py` | 拷贝到 `~/.claude/hooks/`、编译面板、注册 hook |
-| `codex_voice_hook.py` | 把 Codex hook JSON 适配到共用语音逻辑 |
-| `install_codex.py` | 保留并更新 `~/.codex/hooks.json` |
+```text
+.
+├── install.py                    # 统一安装入口：all / claude / codex
+├── installers/
+│   ├── install_claude.py         # 集成 ~/.claude/settings.json
+│   └── install_codex.py          # 集成 ~/.codex/hooks.json
+├── src/
+│   ├── hooks/
+│   │   ├── voice_hook.py         # 共用行为和 Claude hook 入口
+│   │   └── codex_voice_hook.py   # Codex JSON 适配器
+│   ├── daemon/
+│   │   └── tts_daemon.py         # 常驻模型、FIFO、合成和播放
+│   └── macos/
+│       └── VoiceNotch.swift      # 刘海状态面板
+├── tests/
+│   └── test_codex_voice.py
+└── demo/
+    └── queue_demo.m4a
+```
 
 ## License
 

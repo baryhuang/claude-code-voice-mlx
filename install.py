@@ -1,145 +1,61 @@
 #!/usr/bin/env python3
-"""把语音 hook 注册进 ~/.claude/settings.json，保留已有的 hook。
+"""Unified installer for Claude Code and Codex voice feedback.
 
-  python3 install.py            安装
-  python3 install.py --uninstall  卸载
+Examples:
+    python3 install.py                 # install both clients
+    python3 install.py claude          # Claude Code only
+    python3 install.py codex           # Codex only (shared backend required)
+    python3 install.py --uninstall     # uninstall both clients
 """
 
-import json
-import os
-import shutil
-import sys
+import argparse
 
-HOME = os.path.expanduser("~")
-SETTINGS = os.path.join(HOME, ".claude", "settings.json")
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-SOURCE = os.path.join(HERE, "voice_hook.py")
-# 装到 ~/.claude/hooks/ 下，这样这个 git 仓库被挪走/删掉也不会把全局 hook 弄断
-INSTALLED = os.path.join(HOME, ".claude", "hooks", "voice_hook.py")
-# 常驻服务同理
-DAEMON_SOURCE = os.path.join(HERE, "tts_daemon.py")
-DAEMON_INSTALLED = os.path.join(HOME, ".claude", "hooks", "tts_daemon.py")
-# 刘海状态条（可选，需要 Xcode 的 swiftc）
-NOTCH_SOURCE = os.path.join(HERE, "VoiceNotch.swift")
-NOTCH_BIN = os.path.join(HOME, ".claude", "hooks", "voice-notch")
-COMMAND = f"/usr/bin/env python3 {INSTALLED}"
-
-# 老版本直接指向仓库里的脚本，升级时一并清掉
-LEGACY_COMMANDS = {f"/usr/bin/env python3 {SOURCE}"}
-
-# 事件 -> 是否需要 matcher 字段
-EVENTS = {
-    "Stop": False,
-    "Notification": False,
-    "UserPromptSubmit": False,
-}
+from installers import install_claude, install_codex
 
 
-def load():
-    if not os.path.exists(SETTINGS):
-        return {}
-    with open(SETTINGS) as f:
-        return json.load(f)
-
-
-def copy_hook():
-    os.makedirs(os.path.dirname(INSTALLED), exist_ok=True)
-    for src, dst in ((SOURCE, INSTALLED), (DAEMON_SOURCE, DAEMON_INSTALLED)):
-        if os.path.exists(src):
-            shutil.copy2(src, dst)
-            os.chmod(dst, 0o755)
-    build_notch()
-
-
-def build_notch():
-    """有 swiftc 就把刘海状态条编译出来；没有就跳过，纯语音照常工作。"""
-    import subprocess
-    if not os.path.exists(NOTCH_SOURCE):
-        return
-    if not shutil.which("swiftc"):
-        print("提示: 没找到 swiftc，跳过刘海状态条（装 Xcode 后重跑 install.py）")
-        return
-    src_m = os.path.getmtime(NOTCH_SOURCE)
-    if os.path.exists(NOTCH_BIN) and os.path.getmtime(NOTCH_BIN) >= src_m:
-        return                                      # 没改过源码，不用重编
-    print("编译刘海状态条 …")
-    r = subprocess.run(["swiftc", "-O", NOTCH_SOURCE, "-o", NOTCH_BIN],
-                       capture_output=True, text=True)
-    if r.returncode == 0:
-        print(f"已生成 {NOTCH_BIN}")
-    else:
-        print(f"编译失败（不影响语音）:\n{r.stderr[:800]}")
-
-
-def strip_commands(settings, targets):
-    """从所有事件里摘掉这些 command，返回受影响的事件名。"""
-    hooks = settings.get("hooks", {})
-    removed = []
-    for event in list(hooks):
-        kept = []
-        for entry in hooks[event]:
-            inner = entry.get("hooks", [])
-            pruned = [h for h in inner if h.get("command") not in targets]
-            if len(pruned) != len(inner):
-                removed.append(event)
-            if pruned or not inner:
-                entry["hooks"] = pruned
-                kept.append(entry)
-        hooks[event] = kept
-    return removed
-
-
-def install(settings):
-    copy_hook()
-    strip_commands(settings, LEGACY_COMMANDS)   # 清掉指向仓库的老注册
-    hooks = settings.setdefault("hooks", {})
-    added = []
-    for event in EVENTS:
-        entries = hooks.setdefault(event, [])
-        already = any(
-            h.get("command") == COMMAND
-            for entry in entries
-            for h in entry.get("hooks", [])
-        )
-        if already:
-            continue
-        entries.append({"hooks": [{"type": "command", "command": COMMAND}]})
-        added.append(event)
-    return added
-
-
-def uninstall(settings):
-    removed = strip_commands(settings, LEGACY_COMMANDS | {COMMAND})
-    try:
-        os.remove(INSTALLED)
-    except OSError:
-        pass
-    return removed
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Install voice feedback for Claude Code and/or Codex.",
+        epilog=(
+            "examples:\n"
+            "  python3 install.py                 install both clients\n"
+            "  python3 install.py claude          install Claude Code only\n"
+            "  python3 install.py codex           install Codex only\n"
+            "  python3 install.py --uninstall     uninstall both clients"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "client",
+        nargs="?",
+        choices=("all", "claude", "codex"),
+        default="all",
+        help="client to configure (default: all)",
+    )
+    parser.add_argument(
+        "--uninstall",
+        action="store_true",
+        help="remove the selected client hooks",
+    )
+    return parser.parse_args()
 
 
 def main():
-    settings = load()
-    if os.path.exists(SETTINGS):
-        shutil.copy2(SETTINGS, SETTINGS + ".bak")
+    args = parse_args()
+    action = ["--uninstall"] if args.uninstall else []
 
-    if "--uninstall" in sys.argv:
-        changed = uninstall(settings)
-        verb = "移除"
-    else:
-        changed = install(settings)
-        verb = "注册"
+    targets = ("claude", "codex") if args.client == "all" else (args.client,)
+    # Remove the client adapters before the shared backend; install in the
+    # opposite order so Codex can immediately reuse the backend.
+    if args.uninstall:
+        targets = tuple(reversed(targets))
 
-    os.makedirs(os.path.dirname(SETTINGS), exist_ok=True)
-    with open(SETTINGS, "w") as f:
-        json.dump(settings, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-
-    if changed:
-        print(f"已{verb}: {', '.join(sorted(set(changed)))}")
-    else:
-        print("没有变化（可能已经装过了）")
-    print(f"备份: {SETTINGS}.bak")
+    for target in targets:
+        print(f"\n== {'卸载' if args.uninstall else '安装'} {target} ==")
+        if target == "claude":
+            install_claude.main(action)
+        else:
+            install_codex.main(action)
 
 
 if __name__ == "__main__":

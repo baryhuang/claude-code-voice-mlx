@@ -4,8 +4,8 @@
 This keeps the existing Claude Code voice backend (model, reference audio,
 daemon, queue, and notch UI) and only adds the small Codex adapter.
 
-    python3 install_codex.py
-    python3 install_codex.py --uninstall
+    python3 install.py codex
+    python3 install.py codex --uninstall
 """
 
 import json
@@ -20,7 +20,8 @@ CODEX_DIR = os.path.join(HOME, ".codex")
 HOOKS_PATH = os.path.join(CODEX_DIR, "hooks.json")
 HOOK_DIR = os.path.join(CODEX_DIR, "hooks")
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+HOOK_SOURCE_DIR = os.path.join(ROOT, "src", "hooks")
 FILES = ("voice_hook.py", "codex_voice_hook.py")
 COMMAND = ("/usr/bin/env python3 "
            + shlex.quote(os.path.join(HOOK_DIR, "codex_voice_hook.py")))
@@ -77,7 +78,7 @@ def strip_command(data):
 def copy_scripts():
     os.makedirs(HOOK_DIR, exist_ok=True)
     for name in FILES:
-        src = os.path.join(HERE, name)
+        src = os.path.join(HOOK_SOURCE_DIR, name)
         dst = os.path.join(HOOK_DIR, name)
         shutil.copy2(src, dst)
         os.chmod(dst, 0o755)
@@ -117,9 +118,10 @@ def save(data):
         f.write("\n")
 
 
-def main():
+def main(args=None):
+    args = sys.argv[1:] if args is None else args
     data = load_hooks()
-    uninstalling = "--uninstall" in sys.argv
+    uninstalling = "--uninstall" in args
     changed = uninstall(data) if uninstalling else install(data)
     save(data)
 
@@ -132,7 +134,7 @@ def main():
     if not uninstalling:
         backend = os.path.join(HOME, ".claude", "hooks", "tts_daemon.py")
         if not os.path.exists(backend):
-            print("提示: 没找到现有语音后端；先运行 python3 install.py，"
+            print("提示: 没找到现有语音后端；先运行 python3 install.py claude，"
                   "否则 Codex 会降级使用 macOS say。")
         print("下一步: 在 Codex CLI 输入 /hooks，审核并信任这三个 hook。")
 

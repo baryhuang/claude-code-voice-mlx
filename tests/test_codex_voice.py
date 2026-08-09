@@ -1,12 +1,15 @@
 import io
 import json
+import os
+import tempfile
 import unittest
 from contextlib import redirect_stdout
+from types import SimpleNamespace
 from unittest import mock
 
-import codex_voice_hook
-import install_codex
-import voice_hook
+import install as install_entry
+from installers import install_claude, install_codex
+from src.hooks import codex_voice_hook, voice_hook
 
 
 class CodexPayloadTests(unittest.TestCase):
@@ -57,6 +60,17 @@ class CodexPayloadTests(unittest.TestCase):
 
 
 class CodexInstallerTests(unittest.TestCase):
+    def test_copy_scripts_uses_the_reorganized_source_tree(self):
+        with tempfile.TemporaryDirectory() as hook_dir:
+            with mock.patch.object(install_codex, "HOOK_DIR", hook_dir):
+                install_codex.copy_scripts()
+            for name in install_codex.FILES:
+                installed = os.path.join(hook_dir, name)
+                source = os.path.join(install_codex.HOOK_SOURCE_DIR, name)
+                self.assertTrue(os.path.exists(installed))
+                with open(installed, "rb") as got, open(source, "rb") as expected:
+                    self.assertEqual(got.read(), expected.read())
+
     def test_install_preserves_other_hooks_and_is_idempotent(self):
         other = {
             "hooks": [{"type": "command", "command": "python3 other.py"}]
@@ -85,6 +99,49 @@ class CodexInstallerTests(unittest.TestCase):
                    for handler in group["hooks"]
                    if handler.get("command") == install_codex.COMMAND]
             self.assertEqual(len(own), 1)
+
+
+class UnifiedInstallerTests(unittest.TestCase):
+    def test_claude_installer_uses_the_reorganized_source_tree(self):
+        with tempfile.TemporaryDirectory() as hook_dir:
+            installed_hook = os.path.join(hook_dir, "voice_hook.py")
+            installed_daemon = os.path.join(hook_dir, "tts_daemon.py")
+            with (mock.patch.object(install_claude, "INSTALLED", installed_hook),
+                  mock.patch.object(install_claude, "DAEMON_INSTALLED",
+                                    installed_daemon),
+                  mock.patch.object(install_claude, "build_notch")):
+                install_claude.copy_hook()
+            for source, installed in (
+                (install_claude.SOURCE, installed_hook),
+                (install_claude.DAEMON_SOURCE, installed_daemon),
+            ):
+                with open(installed, "rb") as got, open(source, "rb") as expected:
+                    self.assertEqual(got.read(), expected.read())
+
+    def test_default_installs_claude_then_codex(self):
+        calls = []
+        args = SimpleNamespace(client="all", uninstall=False)
+        with (mock.patch.object(install_entry, "parse_args", return_value=args),
+              mock.patch.object(install_entry.install_claude, "main",
+                                side_effect=lambda value: calls.append(("claude", value))),
+              mock.patch.object(install_entry.install_codex, "main",
+                                side_effect=lambda value: calls.append(("codex", value))),
+              redirect_stdout(io.StringIO())):
+            install_entry.main()
+        self.assertEqual(calls, [("claude", []), ("codex", [])])
+
+    def test_uninstall_removes_codex_before_shared_backend(self):
+        calls = []
+        args = SimpleNamespace(client="all", uninstall=True)
+        with (mock.patch.object(install_entry, "parse_args", return_value=args),
+              mock.patch.object(install_entry.install_claude, "main",
+                                side_effect=lambda value: calls.append(("claude", value))),
+              mock.patch.object(install_entry.install_codex, "main",
+                                side_effect=lambda value: calls.append(("codex", value))),
+              redirect_stdout(io.StringIO())):
+            install_entry.main()
+        self.assertEqual(calls, [("codex", ["--uninstall"]),
+                                 ("claude", ["--uninstall"])])
 
 
 if __name__ == "__main__":
