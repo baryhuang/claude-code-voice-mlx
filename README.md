@@ -1,8 +1,8 @@
-# claude-code-voice-mlx
+# Voice Feedback for Claude Code + Codex (MLX)
 
 **English** · [中文文档](#中文文档)
 
-**Claude Code talks on your Mac.** Text-to-speech output for Claude Code on
+**Claude Code and Codex talk on your Mac.** Text-to-speech output for both on
 macOS / Apple Silicon. Replies are synthesized locally on Apple MLX by
 MOSS-TTS-Nano, a 100M voice-cloning model — it speaks in the voice of any
 5–10 s reference clip you provide, which also covers accents no preset voice
@@ -22,19 +22,25 @@ synthesis at ~9–11× real time, ~470 MB resident memory, ~280 MB on disk.
 two sessions played through the queue, project name announced on speaker change
 (12 s).
 
+| Client | Lifecycle hooks | Installer |
+| --- | --- | --- |
+| Claude Code | `UserPromptSubmit`, `Notification`, `Stop` | `install.py` |
+| Codex | `UserPromptSubmit`, `PermissionRequest`, `Stop` | `install_codex.py` |
+
 ---
 
 ## Architecture
 
 ```
-Claude Code session ──hook──▶ voice_hook.py ──unix socket──▶ tts_daemon.py ──afplay──▶ audio out
-                                   │                              │
-                                   │ fallback: /usr/bin/say       │ atomic write
-                                   ▼                              ▼
-                          ~/.claude/voice_hook.log      ~/.claude/.voice_status.json
-                                                                  │ 250 ms poll
-                                                                  ▼
-                                                          voice-notch (SwiftUI)
+Claude Code ──lifecycle hooks──▶ voice_hook.py ─┐
+                                               ├──unix socket──▶ tts_daemon.py ──afplay──▶ audio out
+Codex ──lifecycle hooks──▶ codex_voice_hook.py ─┘                       │
+                                                                       │ atomic write
+                         fallback: /usr/bin/say                         ▼
+                                                        ~/.claude/.voice_status.json
+                                                                       │ 250 ms poll
+                                                                       ▼
+                                                               voice-notch (SwiftUI)
 ```
 
 ### Queue semantics
@@ -54,8 +60,8 @@ Claude Code session ──hook──▶ voice_hook.py ──unix socket──▶
 `tts_daemon.py` keeps the model in memory. Model load takes ~3 s; warmup
 (first synthesis, tokenizer fetch, compile) finishes ~6 s after start. The
 hook sends one JSON message over a unix socket and returns after the
-round-trip (single-digit milliseconds); Claude Code is not blocked by
-synthesis.
+round-trip (single-digit milliseconds); neither Claude Code nor Codex is
+blocked by synthesis.
 
 The voice comes from the reference clip at `moss_ref_audio`
 (`~/.claude/voice_ref.wav` by default). Without that file the daemon exits and
@@ -72,9 +78,10 @@ still playing, so there is no gap at utterance boundaries.
 ### What is spoken
 
 The hook looks for lines beginning with `🔊` in the final reply and speaks
-only those. Without the marker, the full reply is cleaned and spoken instead.
-The intended setup instructs the agent (via `~/.claude/CLAUDE.md`) to start
-each reply with one short `🔊` summary line:
+only those. Without the marker, only the cleaned opening ~100 characters are
+spoken. The intended setup instructs both clients (via
+`~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md`) to start each reply with one
+short `🔊` summary line:
 
 ```markdown
 Every reply must start with a 🔊 line: one sentence, under 50 characters,
@@ -120,8 +127,9 @@ Small details that made or broke this, none of which raised an error:
 1. **macOS lists voices that don't exist.** Uninstalled voice packs synthesize
    silence and exit 0. Detection: output file size — silence is a constant
    ~4800 bytes, speech is six figures.
-2. **The `Stop` hook races the transcript flush** and usually wins, reading an
-   empty reply. Retry at 150 ms intervals for up to 900 ms.
+2. **Claude Code's `Stop` hook races the transcript flush** and usually wins,
+   reading an empty reply. Retry at 150 ms intervals for up to 900 ms. Codex
+   supplies `last_assistant_message` directly and avoids this race.
 3. **Barge-in bookkeeping must outlive synthesis.** Synthesis runs ~10×
    faster than playback; dropping the utterance→session map when synthesis
    finished meant the playing utterance was untraceable and cancel found
@@ -140,7 +148,7 @@ Small details that made or broke this, none of which raised an error:
 
 ---
 
-## Install
+## Install Claude Code + Codex
 
 Requires Apple Silicon and macOS. Python 3.13+ currently has no wheels for
 the dependencies; use 3.12.
@@ -157,7 +165,14 @@ ffmpeg -i your_voice.mp3 -t 10 -ac 1 -ar 48000 -sample_fmt s16 ~/.claude/voice_r
 
 python3 install.py
 ~/.claude/hooks/voice_hook.py --test
+
+# add Codex support using the same local voice backend and playback queue
+python3 install_codex.py
+codex
+# inside Codex, run /hooks once and trust the three voice hooks
 ```
+
+### 1. Shared voice backend and Claude Code
 
 `install.py` copies `voice_hook.py` and `tts_daemon.py` to
 `~/.claude/hooks/`, compiles the notch panel, and registers three hooks in
@@ -169,13 +184,43 @@ running sessions pick the hooks up without restart.
 
 Uninstall: `python3 install.py --uninstall`.
 
+### 2. Codex
+
+After the Claude voice backend above is working, register the equivalent
+Codex lifecycle hooks:
+
+```bash
+python3 install_codex.py
+codex                 # then run /hooks and trust the three new hooks
+```
+
+The adapter writes `~/.codex/hooks.json` without replacing existing hooks and
+backs up an existing file as `hooks.json.bak`. It reuses the same MOSS model,
+reference clip, daemon, FIFO, configuration, and notch panel as Claude Code,
+so both clients share one ordered audio queue. Uninstall only the Codex
+adapter with `python3 install_codex.py --uninstall`.
+
+Codex `Stop` supplies `last_assistant_message` directly, avoiding the
+transcript-flush race. `PermissionRequest` is the Codex equivalent used for
+spoken approval notices. Codex requires new or changed command hooks to be
+reviewed once with `/hooks` before they run.
+
+For short spoken summaries in every repository, add the same `🔊` convention
+to `~/.codex/AGENTS.md`:
+
+```markdown
+Every final reply must start with a 🔊 line: one sentence, under 50 characters,
+plain spoken language, no code or paths. Only that line is read aloud.
+```
+
 ## Hooks
 
-| Event | Behavior |
-| --- | --- |
-| `Stop` | Extract the `🔊` lines from the finished reply and enqueue them |
-| `Notification` | Speak permission requests and idle notices |
-| `UserPromptSubmit` | Cancel this session's audio; acknowledge the prompt; handle quiet phrases |
+| Client | Event | Behavior |
+| --- | --- | --- |
+| Both | `UserPromptSubmit` | Cancel this session's audio; acknowledge the prompt; handle quiet phrases |
+| Both | `Stop` | Extract the `🔊` lines from the finished reply and enqueue them |
+| Claude Code | `Notification` | Speak permission requests and idle notices |
+| Codex | `PermissionRequest` | Speak approval requests before the prompt is shown |
 
 `SubagentStop` events return without speaking.
 
@@ -227,9 +272,9 @@ reply respawns it).
 - No long-running-command narration: between reply boundaries the system is
   silent unless a permission notification fires.
 - Playback stops when the Mac sleeps; the daemon does not prevent sleep.
-- The `🔊` convention depends on the model following the CLAUDE.md
-  instruction. When it does not, the cleaned full reply is spoken, which is
-  long.
+- The `🔊` convention depends on the model following `CLAUDE.md` or
+  `AGENTS.md`. When it does not, only the cleaned opening ~100 characters are
+  spoken.
 - macOS and Apple Silicon only.
 
 ---
@@ -307,12 +352,16 @@ audible as start-of-utterance delay, which defeats the ordered-queue design.
 | `tts_daemon.py` | Resident TTS server: FIFO queue, sentence pipelining, per-session cancel |
 | `VoiceNotch.swift` | Notch status panel |
 | `install.py` | Copy to `~/.claude/hooks/`, compile panel, register hooks |
+| `codex_voice_hook.py` | Codex JSON adapter for the shared voice hook |
+| `install_codex.py` | Preserve and update `~/.codex/hooks.json` |
 
 ---
 
 # 中文文档
 
-**让 Claude Code 在你的 Mac 上开口说话。** 回复由本地 Apple MLX 上运行的
+**Claude Code + Codex 本地语音反馈。**
+
+**让 Claude Code 和 Codex 都在你的 Mac 上开口说话。** 回复由本地 Apple MLX 上运行的
 MOSS-TTS-Nano 合成播放——这是一个一亿参数的声音克隆模型，你给一段 5–10 秒的
 参考音频，它就用那个声音说话，预置音色没有的口音（比如台湾腔）也因此可用。
 多个并发会话共用一个播放队列：按顺序一段一段播完，换会话时报项目名，取消一个
@@ -326,17 +375,23 @@ MOSS-TTS-Nano 合成播放——这是一个一亿参数的声音克隆模型，
 **试听：** [demo/queue_demo.m4a](demo/queue_demo.m4a) — 两个会话的三段话
 经过队列播放，换会话时报项目名（12 秒）。
 
+| 客户端 | 生命周期 Hooks | 安装器 |
+| --- | --- | --- |
+| Claude Code | `UserPromptSubmit`、`Notification`、`Stop` | `install.py` |
+| Codex | `UserPromptSubmit`、`PermissionRequest`、`Stop` | `install_codex.py` |
+
 ## 架构
 
 ```
-Claude Code 会话 ──hook──▶ voice_hook.py ──unix socket──▶ tts_daemon.py ──afplay──▶ 声音输出
-                              │                              │
-                              │ 兜底: /usr/bin/say           │ 原子写入
-                              ▼                              ▼
-                     ~/.claude/voice_hook.log      ~/.claude/.voice_status.json
-                                                             │ 250ms 轮询
-                                                             ▼
-                                                     voice-notch (SwiftUI)
+Claude Code ──生命周期 hooks──▶ voice_hook.py ─┐
+                                               ├──unix socket──▶ tts_daemon.py ──afplay──▶ 声音输出
+Codex ──生命周期 hooks──▶ codex_voice_hook.py ─┘                       │
+                                                                       │ 原子写入
+                           兜底: /usr/bin/say                           ▼
+                                                        ~/.claude/.voice_status.json
+                                                                       │ 250ms 轮询
+                                                                       ▼
+                                                               voice-notch (SwiftUI)
 ```
 
 ### 队列语义
@@ -352,7 +407,7 @@ Claude Code 会话 ──hook──▶ voice_hook.py ──unix socket──▶ 
 
 `tts_daemon.py` 把模型留在内存里。模型加载约 3 秒，预热（首次合成、拉取
 tokenizer、编译）在启动后约 6 秒完成。hook 通过 unix socket 发一条 JSON 就
-返回（毫秒级），Claude Code 不会被合成阻塞。
+返回（毫秒级），Claude Code 和 Codex 都不会被合成阻塞。
 
 声音来自 `moss_ref_audio` 指向的参考音频（默认 `~/.claude/voice_ref.wav`）。
 文件不存在时守护进程直接退出，hook 自动降级用 `/usr/bin/say`，不会彻底无声。
@@ -365,8 +420,9 @@ tokenizer、编译）在启动后约 6 秒完成。hook 通过 unix socket 发�
 
 ### 念什么
 
-hook 只念最终回复里以 `🔊` 开头的行；没有标记就念清洗后的全文。配套做法是在
-`~/.claude/CLAUDE.md` 里约定每条回复第一行写一句 `🔊` 摘要。
+hook 只念最终回复里以 `🔊` 开头的行；没有标记就只念清洗后的开头约 100 字。
+配套做法是在 `~/.claude/CLAUDE.md` 和 `~/.codex/AGENTS.md` 里约定每条回复
+第一行写一句 `🔊` 摘要。
 
 合成前的清洗：代码块 →"（一段代码）"；长路径只留文件名；URL、emoji、
 markdown 符号、表格竖线删除；思考过程和干活途中的旁白不念，只念本轮最后
@@ -392,8 +448,9 @@ mtime。`install.py` 检测到 `swiftc` 就编译；没有也不影响语音。�
 
 1. **macOS 会列出不存在的声音。** 语音包没装的声音合成出静音、退出码 0。
    判据：文件大小——静音恒约 4800 字节，真语音是六位数。
-2. **`Stop` hook 和 transcript 落盘是竞态**，hook 常先跑、读到空回复。
-   以 150 毫秒间隔重试，最多 900 毫秒。
+2. **Claude Code 的 `Stop` hook 和 transcript 落盘是竞态**，hook 常先跑、
+   读到空回复。以 150 毫秒间隔重试，最多 900 毫秒。Codex 直接提供
+   `last_assistant_message`，没有这个竞态。
 3. **打断的账本必须活到播放结束。** 合成比播放快约 10 倍；合成一完就删
    话语→会话映射，正在播的那段就查无此人，取消永远扑空。
 4. **模型输出立体声 `(N, 2)`。** `reshape(-1)` 把左右声道交错摊成双倍长的
@@ -404,7 +461,7 @@ mtime。`install.py` 检测到 `swiftc` 就编译；没有也不影响语音。�
 7. **第一块限 24 字**（后续 60）：开口延迟只由第一块决定，越小越快。
 8. **状态文件用 `os.replace` 写**，刘海面板永远读不到半截 JSON。
 
-## 安装
+## 安装 Claude Code + Codex
 
 需要 Apple Silicon 和 macOS。Python 3.13+ 目前没有依赖的 wheel，用 3.12。
 
@@ -420,7 +477,14 @@ ffmpeg -i 你的声音.mp3 -t 10 -ac 1 -ar 48000 -sample_fmt s16 ~/.claude/voice
 
 python3 install.py
 ~/.claude/hooks/voice_hook.py --test
+
+# 使用同一个本地声音后端和播放队列，加入 Codex 支持
+python3 install_codex.py
+codex
+# 在 Codex 里输入一次 /hooks，信任三个语音 hook
 ```
+
+### 1. 共用语音后端和 Claude Code
 
 `install.py` 把两个 Python 文件拷到 `~/.claude/hooks/`、编译刘海面板、在
 `~/.claude/settings.json`（用户级，所有项目生效）注册三个 hook；已有 hook
@@ -429,13 +493,39 @@ python3 install.py
 
 卸载：`python3 install.py --uninstall`。
 
+### 2. Codex
+
+上面的 Claude 语音后端能工作后，注册对应的 Codex lifecycle hooks：
+
+```bash
+python3 install_codex.py
+codex                 # 然后输入 /hooks，信任新加入的三个 hook
+```
+
+安装器会保留 `~/.codex/hooks.json` 里已有的 hook，并把旧文件备份为
+`hooks.json.bak`。Codex 和 Claude Code 共用同一个 MOSS 模型、参考声音、
+常驻服务、FIFO 队列、配置和刘海面板，因此两边同时工作时仍然按一个队列播报。
+只卸载 Codex 适配器：`python3 install_codex.py --uninstall`。
+
+Codex 的 `Stop` 直接提供 `last_assistant_message`，没有 transcript 落盘竞态；
+权限语音提醒使用 `PermissionRequest`。Codex 对新建或变更过的命令 hook 要求先
+通过 `/hooks` 审核信任一次。
+
+如果希望所有项目只念简短结论，把同样的约定加入 `~/.codex/AGENTS.md`：
+
+```markdown
+每条最终回复必须以 🔊 行开头：一句话、50 字以内、适合朗读，不含代码和路径。
+只有这一行会被念出来。
+```
+
 ## Hooks
 
-| 事件 | 行为 |
-| --- | --- |
-| `Stop` | 提取回复里的 `🔊` 行并入队 |
-| `Notification` | 念出权限请求和空闲提示 |
-| `UserPromptSubmit` | 取消本会话语音；回执指令；处理闭嘴口令 |
+| 客户端 | 事件 | 行为 |
+| --- | --- | --- |
+| 两者 | `UserPromptSubmit` | 取消本会话语音；回执指令；处理闭嘴口令 |
+| 两者 | `Stop` | 提取回复里的 `🔊` 行并入队 |
+| Claude Code | `Notification` | 念出权限请求和空闲提示 |
+| Codex | `PermissionRequest` | 在权限确认框出现时念出请求 |
 
 `SubagentStop` 直接返回不念。
 
@@ -478,7 +568,8 @@ ffmpeg -i clip.mp3 -t 10 -ac 1 -ar 48000 -sample_fmt s16 ~/.claude/voice_ref.wav
 - 回执和其他内容走同一个 FIFO，别的会话在播时回执要排队，没有优先通道。
 - 长命令执行期间没有进度播报，除非权限通知触发。
 - Mac 休眠即停，守护进程不阻止休眠。
-- `🔊` 约定依赖模型遵守 CLAUDE.md 指令，不遵守就念清洗后的全文，会很长。
+- `🔊` 约定依赖模型遵守 `CLAUDE.md` 或 `AGENTS.md`；不遵守时只念清洗后的
+  开头约 100 字。
 - 仅支持 macOS 和 Apple Silicon。
 
 ## 排障
@@ -538,6 +629,8 @@ M3 Pro，36 GB，MOSS-TTS-Nano-100M，热启动：
 | `tts_daemon.py` | 常驻合成服务：FIFO 队列、按句流水线、按会话取消 |
 | `VoiceNotch.swift` | 刘海状态面板 |
 | `install.py` | 拷贝到 `~/.claude/hooks/`、编译面板、注册 hook |
+| `codex_voice_hook.py` | 把 Codex hook JSON 适配到共用语音逻辑 |
+| `install_codex.py` | 保留并更新 `~/.codex/hooks.json` |
 
 ## License
 

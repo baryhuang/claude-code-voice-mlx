@@ -426,13 +426,13 @@ def probe_voices():
 # 入口
 # --------------------------------------------------------------------------
 
-def handle_hook(cfg):
-    try:
-        payload = json.load(sys.stdin)
-    except Exception as e:
-        log(f"hook: stdin 解析失败 {e!r}")
-        return
+def handle_payload(payload, cfg):
+    """处理 Claude Code 或 Codex 的 lifecycle hook payload。
 
+    两边的核心字段基本一致。Codex 的 Stop 直接给
+    ``last_assistant_message``，因此优先使用它；Claude Code 没有时再从
+    transcript 取最终回复。
+    """
     event = payload.get("hook_event_name", "")
     # 多会话时得知道是谁在说话。用目录名当人话标签，session_id 用来定向取消。
     session = payload.get("session_id") or "unknown"
@@ -474,6 +474,17 @@ def handle_hook(cfg):
             speak(notification_text(payload.get("message", "")), cfg, session, label)
         return
 
+    if event == "PermissionRequest":
+        if cfg.get("speak_notifications", True):
+            tool = payload.get("tool_name") or "工具"
+            tool_input = payload.get("tool_input")
+            description = (tool_input.get("description")
+                           if isinstance(tool_input, dict) else None)
+            message = (f"需要你批准，{description}" if description
+                       else f"需要你批准，使用 {tool} 工具")
+            speak(message, cfg, session, label)
+        return
+
     if event in ("Stop", "SubagentStop"):
         if event == "SubagentStop":
             return               # 子 agent 不念，太吵
@@ -488,17 +499,19 @@ def handle_hook(cfg):
                 return
         except Exception:
             pass
-        # Stop hook 和 transcript 落盘是同一瞬间的竞态：hook 经常先跑，
-        # 这时最终回复那一行还没写进文件，解析出来是空的。空了就等一下再读。
-        tp = payload.get("transcript_path", "")
-        final = whole = ""
-        for attempt in range(6):
-            final, whole = turn_texts(tp)
-            if final.strip():
-                if attempt:
-                    log(f"Stop: 第 {attempt + 1} 次才读到（落盘竞态）")
-                break
-            time.sleep(0.15)
+        # Codex 直接给最后一条助手消息，不需要碰不稳定的 transcript 格式。
+        # Claude Code 没给这个字段时，沿用原来的 transcript 解析与竞态重试。
+        final = payload.get("last_assistant_message") or ""
+        whole = final
+        if not final.strip():
+            tp = payload.get("transcript_path", "")
+            for attempt in range(6):
+                final, whole = turn_texts(tp)
+                if final.strip():
+                    if attempt:
+                        log(f"Stop: 第 {attempt + 1} 次才读到（落盘竞态）")
+                    break
+                time.sleep(0.15)
         # 优先最终段里的 🔊；没有就退到整个回合里最后出现的 🔊 行
         spoken = extract_spoken(final)
         if not spoken:
@@ -516,6 +529,15 @@ def handle_hook(cfg):
             log(f"Stop: 无 🔊 标记，只念开头（全文 {len(final)} 字）")
         speak(text, cfg, session, label)
         return
+
+
+def handle_hook(cfg):
+    try:
+        payload = json.load(sys.stdin)
+    except Exception as e:
+        log(f"hook: stdin 解析失败 {e!r}")
+        return
+    handle_payload(payload, cfg)
 
 
 def main():
