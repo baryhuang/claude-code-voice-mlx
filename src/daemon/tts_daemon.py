@@ -14,7 +14,11 @@
 协议（unix socket，一行一个 JSON）：
     {"cmd": "speak", "text": "...", "session": "...", "label": "项目名"}
     {"cmd": "stop", "session": "..."}    # 不带 session 就是全停
+    {"cmd": "skip"}    # 只掐正在播的这段，队列继续
     {"cmd": "ping"}    -> {"ok": true, "model": ..., "queue": 队列长度}
+
+静音（配置里的 muted）不走协议，走配置文件：菜单栏图标和 hook 都改那份文件，
+本进程每次合成/播放前看一眼 mtime，改了就重读，所以点完立刻生效。
 """
 
 import json
@@ -59,7 +63,8 @@ def log(msg):
 def load_config():
     cfg = {"model": DEFAULT_MODEL,
            "moss_ref_audio": DEFAULT_REF,      # 克隆参考音频：声音由它决定
-           "announce_session": True}
+           "announce_session": True,
+           "muted": False}
     try:
         with open(CONFIG_PATH) as f:
             cfg.update({k: v for k, v in json.load(f).items() if k in cfg})
@@ -67,6 +72,18 @@ def load_config():
         pass
     cfg["moss_ref_audio"] = os.path.expanduser(cfg["moss_ref_audio"])
     return cfg
+
+
+# 能热改的键。模型和参考音频是加载时定死的，改了要重启才算数，
+# 热更新它们只会让配置和耳朵里听到的对不上。
+HOT_KEYS = ("muted", "announce_session")
+
+
+def config_mtime():
+    try:
+        return os.path.getmtime(CONFIG_PATH)
+    except OSError:
+        return 0
 
 
 # --------------------------------------------------------------------------
@@ -129,9 +146,25 @@ class Engine:
         self.player = None
         self.playing_utt = None
         self.last_session = None        # 换会话时才报项目名
+        self.cfg_mtime = config_mtime()
 
         threading.Thread(target=self._synth_loop, daemon=True).start()
         threading.Thread(target=self._play_loop, daemon=True).start()
+
+    # -- 配置热更新 ------------------------------------------------------
+    def refresh_config(self):
+        """静音是菜单栏随时能点的，所以配置不能只在启动时读一次。"""
+        m = config_mtime()
+        if m == self.cfg_mtime:
+            return
+        self.cfg_mtime = m
+        fresh = load_config()
+        for key in HOT_KEYS:
+            self.cfg[key] = fresh[key]
+
+    def muted(self):
+        self.refresh_config()
+        return bool(self.cfg.get("muted"))
 
     # -- 模型 ------------------------------------------------------------
     def load(self):
@@ -206,6 +239,11 @@ class Engine:
         text = (text or "").strip()
         if not text:
             return 0
+        # 静音时连队都不排：hook 那边已经拦了一道，这里兜住其他直接连
+        # socket 的客户端，顺便避免解除静音后一口气念出攒下的旧汇报。
+        if self.muted():
+            log(f"静音中，丢弃 [{label}] {len(text)}字")
+            return 0
         with self.lock:
             self.next_id += 1
             utt_id = self.next_id
@@ -268,7 +306,8 @@ class Engine:
     def _synth_loop(self):
         while True:
             utt_id, session, label, text = self.utt_q.get()
-            if self._is_dead(utt_id):
+            if self._is_dead(utt_id) or self.muted():
+                # 排队期间被静音的：别再花算力合成了
                 self._finish_playback(utt_id)
                 continue
             try:
@@ -288,7 +327,7 @@ class Engine:
 
         t0 = time.time()
         for i, chunk in enumerate(chunks):
-            if self._is_dead(utt_id):
+            if self._is_dead(utt_id) or self.muted():
                 log(f"#{utt_id} 合成中被取消")
                 return
             wav = self._synth(chunk)
@@ -325,7 +364,8 @@ class Engine:
                     self.playing_utt = None
                 self._finish_playback(utt_id)
                 continue
-            if self._is_dead(utt_id):
+            if self._is_dead(utt_id) or self.muted():
+                # 合成好了才被静音的片段：丢掉，哨兵照常会来收尾
                 self._rm(path)
                 continue
             if self.playing_utt != utt_id:      # 换人说话了，刷新刘海
@@ -407,7 +447,7 @@ def serve():
             if cmd == "ping":
                 conn.sendall(json.dumps({
                     "ok": True, "model": cfg["model"], "voice": cfg["moss_ref_audio"],
-                    "queue": engine.utt_q.qsize(),
+                    "queue": engine.utt_q.qsize(), "muted": engine.muted(),
                 }).encode())
             elif cmd == "stop":
                 engine.stop(req.get("session"))

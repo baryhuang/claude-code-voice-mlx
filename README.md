@@ -24,6 +24,7 @@ parallel agents never talk over one another.
 | **Voice cloning** | Use your own voice, language, or accent instead of a preset voice |
 | **~0.3 s to first sound** | Hear the result immediately instead of waiting for the full reply |
 | **Session-aware FIFO** | Project names are announced on speaker changes; cancellation stays per session |
+| **Menu bar icon + notch handle** | Mute and change settings by clicking; no config file editing |
 | **MacBook notch status** | See who is speaking and how many utterances are queued |
 | **Local after download** | No speech API, API key, or per-character TTS bill |
 
@@ -72,7 +73,11 @@ Codex ──lifecycle hooks──▶ src/hooks/codex_voice_hook.py ─┘       
                                                         ~/.claude/.voice_status.json
                                                                        │ 250 ms poll
                                                                        ▼
-                                                               voice-notch (SwiftUI)
+                                       voice-notch (menu bar icon + notch handle + panel)
+                                                                       │ mute / settings
+                                                                       ▼
+                                                       ~/.claude/voice_config.json
+                                                          (hook and daemon poll mtime)
 ```
 
 ### Queue semantics
@@ -136,19 +141,89 @@ confirms receipt and exposes speech-recognition errors, since the echoed text
 is what the system actually received. Slash commands and quiet phrases are not
 acknowledged.
 
+### Menu bar icon and mute
+
+`VoiceNotch.swift` builds a single binary that provides both the menu bar
+icon and the notch panel. The icon is always in the menu bar (🔇 when muted,
+animated when speaking) and its menu holds every runtime setting:
+
+| Menu item | Effect |
+| --- | --- |
+| **静音（不出声）** | `muted: true` — hooks keep running, nothing is played |
+| **跳过当前这段** | `{"cmd": "skip"}` — drop the playing utterance, keep the queue |
+| **清空队列** | `{"cmd": "stop"}` — drop everything queued and playing |
+| **收到指令先应一声** | `ack_on_prompt` |
+| **念系统通知和批准请求** | `speak_notifications` |
+| **换会话时报项目名** | `announce_session` |
+| **打开配置文件…** | Opens `~/.claude/voice_config.json` |
+
+Mute is a config key, not a socket command, so all three writers agree on one
+state: the menu, the CLI (`voice_hook.py --mute` / `--unmute` /
+`--mute-toggle`), and hand edits. The hook drops speech before it enqueues;
+the daemon re-reads the config (mtime check) before every synthesis and
+playback chunk, so anything already queued is dropped too. Muting also sends
+`stop` so the currently playing chunk is cut immediately rather than after it
+finishes.
+
+`install.py` registers the binary as a login item
+(`~/Library/LaunchAgents/com.claude.voice-notch.plist`). It has to start
+independently of the daemon: while muted, no hook speaks, so no daemon
+spawns — if the icon depended on the daemon it would vanish exactly when it
+is needed to unmute. After **退出**, bring it back with:
+
+```bash
+launchctl kickstart -k gui/$UID/com.claude.voice-notch
+```
+
+### Clicking during playback
+
+Both notch surfaces are buttons, and one of them is always on screen:
+
+| State | What is under the notch | Left click | Right click |
+| --- | --- | --- | --- |
+| idle | the 46×15 handle | menu | mute toggle |
+| speaking | the status pill | menu | mute toggle |
+
+The handle steps aside while the pill is up so the two never stack, and the
+pill's window is resized to exactly the pill (`NSHostingView.fittingSize`) —
+any transparent margin would swallow clicks in the strip where window title
+bars pass. When nothing is showing, the panel goes back to
+`ignoresMouseEvents`.
+
+Right click is there because muting mid-sentence is the urgent case: one click
+and audio stops immediately (`stop` is sent alongside the config write), and
+it stays muted until you turn it back on — mute is a config key, so it also
+survives a daemon restart, unlike the one-shot 「闭嘴」 voice command.
+
+### The notch handle (when the menu bar is full)
+
+A menu bar with no free slots is common on notched MacBooks, and macOS handles
+overflow badly: the status item is created and reports `isVisible == true`,
+but it is placed in the strip left of the notch and its window's
+`occlusionState` never contains `.visible`. The icon simply is not drawn, with
+no error anywhere.
+
+So the app also draws its own control surface: a 46×15 pill directly under the
+notch, always present, dimmed to 42% until the pointer reaches it. Clicking it
+opens the same menu as the status item. Its position is ours to choose, so it
+cannot be pushed off the bar. It hides while the status panel is speaking so
+the two never stack.
+
+The CLI (`voice_hook.py --mute-toggle`, bindable to a hotkey) works regardless
+of both.
+
 ### Notch status panel
 
-`VoiceNotch.swift` is a single-file SwiftUI program that draws a black panel
-under the MacBook notch showing the speaking session's label, the opening
-words of the utterance, and the number queued. It is click-through
-(`ignoresMouseEvents`), sits above the menu bar (`.statusBar` level), and
-hides when nothing is speaking or queued.
+The same binary draws a black panel under the MacBook notch showing the
+speaking session's label, the opening words of the utterance, and the number
+queued. It is click-through (`ignoresMouseEvents`), sits above the menu bar
+(`.statusBar` level), and hides when nothing is speaking, queued, or muted.
 
 It reads `~/.claude/.voice_status.json`, which the daemon rewrites atomically
 (`os.replace`) on every queue transition, and polls mtime at 250 ms.
 `install.py` compiles it with `swiftc` if available; without it, audio
-operates normally and no panel appears. The daemon launches the binary at
-startup if it is not already running.
+operates normally and neither the icon nor the panel appears. The daemon also
+launches the binary at startup if it is not already running.
 
 ---
 
@@ -177,6 +252,15 @@ Small details that made or broke this, none of which raised an error:
    set by the first chunk alone, so make it small.
 8. **Status file written via `os.replace`** so the notch panel never reads a
    torn JSON.
+9. **The mute switch cannot live inside the daemon.** While muted no hook
+   speaks, so no daemon spawns — a UI owned by the daemon disappears exactly
+   when it is needed to unmute. The icon is a login item, and mute is a
+   config key both sides poll, not daemon state.
+10. **A full menu bar silently swallows the status item.** It is created,
+    `isVisible` is true, it has a frame on the menu bar — and it is never
+    drawn. The only API that admits it is `window.occlusionState`, which
+    never contains `.visible`. Hence the notch handle: a surface whose
+    position the app controls.
 
 ---
 
@@ -206,7 +290,8 @@ codex
 ### 1. Shared voice backend and Claude Code
 
 `install.py` copies `voice_hook.py` and `tts_daemon.py` to
-`~/.claude/hooks/`, compiles the notch panel, and registers three hooks in
+`~/.claude/hooks/`, compiles the menu bar app, registers it as a login item,
+and registers three hooks in
 `~/.claude/settings.json` (user scope, all projects; existing hooks are
 preserved and the previous settings file is backed up to `.bak`). Hooks are
 run from `~/.claude/hooks/`, not from the clone, so moving or deleting the
@@ -229,8 +314,9 @@ codex                 # then run /hooks and trust the three new hooks
 
 The adapter writes `~/.codex/hooks.json` without replacing existing hooks and
 backs up an existing file as `hooks.json.bak`. It reuses the same MOSS model,
-reference clip, daemon, FIFO, configuration, and notch panel as Claude Code,
-so both clients share one ordered audio queue. Uninstall only the Codex
+reference clip, daemon, FIFO, configuration, menu bar icon, and notch panel
+as Claude Code, so both clients share one ordered audio queue and one mute
+switch. Uninstall only the Codex
 adapter with `python3 install.py codex --uninstall`. To remove both clients,
 run `python3 install.py --uninstall`.
 
@@ -265,6 +351,7 @@ plain spoken language, no code or paths. Only that line is read aloud.
 ```json
 {
   "enabled": true,
+  "muted": false,
   "engine": "moss",
   "model": "mlx-community/MOSS-TTS-Nano-100M",
   "moss_ref_audio": "~/.claude/voice_ref.wav",
@@ -279,6 +366,14 @@ plain spoken language, no code or paths. Only that line is read aloud.
 `engine: "say"` bypasses the daemon entirely (macOS built-in voices; robotic
 but dependency-free). Replies longer than `max_chars` are truncated at a
 sentence boundary with a spoken notice.
+
+`muted` and `enabled` are different switches. `muted: true` keeps the hooks
+running and only suppresses audio, so barge-in, quiet phrases, and the queue
+still behave normally the moment you unmute; it is the one the menu bar icon
+toggles. `enabled: false` (`voice_hook.py --toggle`) turns the hook off
+entirely. `muted`, `announce_session`, `ack_on_prompt`, and
+`speak_notifications` take effect immediately; `model` and `moss_ref_audio`
+are read when the daemon loads and need a restart.
 
 ### The voice
 
@@ -393,7 +488,7 @@ audible as start-of-utterance delay, which defeats the ordered-queue design.
 │   ├── daemon/
 │   │   └── tts_daemon.py         # resident model, FIFO, synthesis, playback
 │   └── macos/
-│       └── VoiceNotch.swift      # notch status panel
+│       └── VoiceNotch.swift      # menu bar icon + notch status panel
 ├── tests/
 │   └── test_codex_voice.py
 └── demo/
@@ -433,6 +528,7 @@ MOSS-TTS-Nano 合成播放——这是一个一亿参数的声音克隆模型，
 | **声音克隆** | 用自己的声音、语言和口音，不受预置音色限制 |
 | **约 0.3 秒出声** | 不必等整段回复合成完就能听到结果 |
 | **会话感知 FIFO** | 换会话时报项目名，取消语音只影响当前会话 |
+| **菜单栏图标 + 刘海把手** | 静音和各项开关点一下就改，不用翻 JSON |
 | **MacBook 刘海状态** | 一眼看到谁在说话、后面还有几段排队 |
 | **下载后本地运行** | 不需要语音 API、API key 或按字计费 |
 
@@ -467,7 +563,11 @@ Codex ──生命周期 hooks──▶ src/hooks/codex_voice_hook.py ─┘    
                                                         ~/.claude/.voice_status.json
                                                                        │ 250ms 轮询
                                                                        ▼
-                                                               voice-notch (SwiftUI)
+                                       voice-notch (menu bar icon + notch handle + panel)
+                                                                       │ mute / settings
+                                                                       ▼
+                                                       ~/.claude/voice_config.json
+                                                          (hook and daemon poll mtime)
 ```
 
 ### 队列语义
@@ -510,13 +610,72 @@ markdown 符号、表格竖线删除；思考过程和干活途中的旁白不�
 测试跑一遍」。既确认收到，也把语音识别听错的地方暴露出来。斜杠命令和闭嘴
 口令不回执。
 
+### 菜单栏图标与静音
+
+`VoiceNotch.swift` 编译出来的是一个程序，同时提供菜单栏图标和刘海状态条。
+图标常驻菜单栏（静音时是划掉的喇叭，播报时会动），菜单里就是全部运行时设置：
+
+| 菜单项 | 作用 |
+| --- | --- |
+| **静音（不出声）** | `muted: true`——hook 照常跑，只是不播放 |
+| **跳过当前这段** | `{"cmd": "skip"}`——掐掉正在播的，队列继续 |
+| **清空队列** | `{"cmd": "stop"}`——正在播的和排队的一起丢掉 |
+| **收到指令先应一声** | `ack_on_prompt` |
+| **念系统通知和批准请求** | `speak_notifications` |
+| **换会话时报项目名** | `announce_session` |
+| **打开配置文件…** | 打开 `~/.claude/voice_config.json` |
+
+静音是配置里的键，不是 socket 命令，所以三个入口说的是同一件事：菜单、
+命令行（`voice_hook.py --mute` / `--unmute` / `--mute-toggle`）和手改配置。
+hook 在入队之前就丢掉文本；守护进程每次合成、每次播放前看一眼配置 mtime，
+已经排在队列里的也一并丢掉。点静音时还会顺手发一条 `stop`，正在播的那半句
+立刻断掉，不用等它念完。
+
+`install.py` 会把这个程序注册成登录项
+（`~/Library/LaunchAgents/com.claude.voice-notch.plist`）。它必须独立于守护
+进程启动：静音时没有 hook 会说话，守护进程根本不会被拉起——如果图标归守护
+进程管，就会在你最需要它取消静音的时候消失。菜单里点了**退出**之后想再打开：
+
+```bash
+launchctl kickstart -k gui/$UID/com.claude.voice-notch
+```
+
+### 播报当中怎么点
+
+刘海下面这两块都是按钮，任何时候都有一块在：
+
+| 状态 | 刘海下面是什么 | 左键 | 右键 |
+| --- | --- | --- | --- |
+| 空闲 | 46×15 的小把手 | 菜单 | 直接静音／取消静音 |
+| 播报中 | 状态条本身 | 菜单 | 直接静音／取消静音 |
+
+状态条弹出时把手让位，两块黑的不会叠；状态条的窗口按
+`NSHostingView.fittingSize` 收到刚好包住它——多出来的透明边会吞掉点击，而那
+一带正是窗口标题栏经过的地方。都不显示时面板恢复点击穿透。
+
+右键是为了「正在念的时候马上闭嘴」这个急事：一下就停（写配置的同时发
+`stop`），而且一直静音到你自己打开为止——静音是配置里的键，守护进程重启也还
+在，跟一次性的「闭嘴」口令不是一回事。
+
+### 刘海把手（菜单栏塞满时）
+
+有刘海的 MacBook 很容易把菜单栏塞满，而 macOS 处理溢出的方式很糟：图标建出来
+了、`isVisible` 也是 true，但它被排进刘海左边那条，窗口的 `occlusionState`
+里始终没有 `.visible`——就是不画出来，而且哪儿都不报错。
+
+所以程序自己还画了一块入口：刘海正下方 46×15 的小把手，一直在，平时只有 42%
+浓度，鼠标靠近才显出来。点它弹出的菜单和菜单栏图标那份一模一样。位置由我们
+自己定，挤不掉。播报状态条弹出时它自动让位，两块黑的不会叠在一起。
+
+命令行（`voice_hook.py --mute-toggle`，可以绑快捷键）在两者之外任何时候都能用。
+
 ### 刘海状态条
 
-`VoiceNotch.swift` 是单文件 SwiftUI 程序，在刘海下方画一块黑色面板，显示
-正在播报的会话名、内容开头和排队数量。点击穿透，位于菜单栏之上，空闲时隐藏。
+同一个程序在刘海下方画一块黑色面板，显示正在播报的会话名、内容开头和排队
+数量。点击穿透，位于菜单栏之上，空闲、静音时隐藏。
 它读守护进程每次队列变化时原子重写（`os.replace`）的状态文件，250 毫秒轮询
-mtime。`install.py` 检测到 `swiftc` 就编译；没有也不影响语音。守护进程启动时
-自动拉起面板。
+mtime。`install.py` 检测到 `swiftc` 就编译；没有 `swiftc` 则图标和面板都没有，
+不影响语音。守护进程启动时也会拉起它（如果还没在跑）。
 
 ## 工程笔记
 
@@ -536,6 +695,13 @@ mtime。`install.py` 检测到 `swiftc` 就编译；没有也不影响语音。�
    复印。要用真人录音。
 7. **第一块限 24 字**（后续 60）：开口延迟只由第一块决定，越小越快。
 8. **状态文件用 `os.replace` 写**，刘海面板永远读不到半截 JSON。
+9. **静音开关不能长在守护进程里。** 静音时没有 hook 会说话，守护进程也就
+   不会被拉起——归它管的界面正好在你要取消静音时消失。所以图标是登录项，
+   静音是两边各自轮询的配置键，不是守护进程的内部状态。
+10. **菜单栏塞满时状态栏图标会被无声吞掉。** 图标建出来了、`isVisible` 是
+    true、frame 也在菜单栏上，就是不画。唯一肯说实话的 API 是
+    `window.occlusionState`——里面永远没有 `.visible`。刘海把手就是为此而来：
+    位置由程序自己说了算。
 
 ## 安装 Claude Code + Codex
 
@@ -561,7 +727,8 @@ codex
 
 ### 1. 共用语音后端和 Claude Code
 
-`install.py` 把两个 Python 文件拷到 `~/.claude/hooks/`、编译刘海面板、在
+`install.py` 把两个 Python 文件拷到 `~/.claude/hooks/`、编译菜单栏图标并注册
+成登录项、在
 `~/.claude/settings.json`（用户级，所有项目生效）注册三个 hook；已有 hook
 保留，旧配置备份为 `.bak`。hook 从 `~/.claude/hooks/` 运行，不依赖 clone
 目录。Claude Code 每次事件都重读 hook 配置，运行中的会话无需重启。
@@ -581,7 +748,8 @@ codex                 # 然后输入 /hooks，信任新加入的三个 hook
 
 安装器会保留 `~/.codex/hooks.json` 里已有的 hook，并把旧文件备份为
 `hooks.json.bak`。Codex 和 Claude Code 共用同一个 MOSS 模型、参考声音、
-常驻服务、FIFO 队列、配置和刘海面板，因此两边同时工作时仍然按一个队列播报。
+常驻服务、FIFO 队列、配置、菜单栏图标和刘海面板，因此两边同时工作时仍然按一个
+队列播报，静音也是一起静音。
 只卸载 Codex 适配器：`python3 install.py codex --uninstall`。两边一起卸载：
 `python3 install.py --uninstall`。
 
@@ -614,6 +782,7 @@ Codex 的 `Stop` 直接提供 `last_assistant_message`，没有 transcript 落�
 ```json
 {
   "enabled": true,
+  "muted": false,
   "engine": "moss",
   "model": "mlx-community/MOSS-TTS-Nano-100M",
   "moss_ref_audio": "~/.claude/voice_ref.wav",
@@ -627,6 +796,12 @@ Codex 的 `Stop` 直接提供 `last_assistant_message`，没有 transcript 落�
 
 `engine: "say"` 完全绕过守护进程（系统自带声音，机械但零依赖）。超过
 `max_chars` 的回复在句号处截断并念一句提示。
+
+`muted` 和 `enabled` 是两个开关。`muted: true` 时 hook 照常运行，只是不出声，
+打断、闭嘴口令、队列这些逻辑都还在，取消静音后立刻恢复正常——菜单栏图标点
+的就是它。`enabled: false`（`voice_hook.py --toggle`）是把 hook 整个关掉。
+`muted`、`announce_session`、`ack_on_prompt`、`speak_notifications` 改完立刻
+生效；`model` 和 `moss_ref_audio` 是守护进程加载时读的，改完要重启。
 
 ### 声音
 
@@ -714,7 +889,7 @@ M3 Pro，36 GB，MOSS-TTS-Nano-100M，热启动：
 │   ├── daemon/
 │   │   └── tts_daemon.py         # 常驻模型、FIFO、合成和播放
 │   └── macos/
-│       └── VoiceNotch.swift      # 刘海状态面板
+│       └── VoiceNotch.swift      # 菜单栏图标 + 刘海状态面板
 ├── tests/
 │   └── test_codex_voice.py
 └── demo/

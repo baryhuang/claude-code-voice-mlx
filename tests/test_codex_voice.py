@@ -9,6 +9,7 @@ from unittest import mock
 
 import install as install_entry
 from installers import install_claude, install_codex
+from src.daemon import tts_daemon
 from src.hooks import codex_voice_hook, voice_hook
 
 
@@ -57,6 +58,81 @@ class CodexPayloadTests(unittest.TestCase):
               redirect_stdout(output)):
             codex_voice_hook.main()
         self.assertEqual(json.loads(output.getvalue()), {})
+
+
+class MuteTests(unittest.TestCase):
+    """静音 = 不出声，但 hook 该跑的逻辑照跑。"""
+
+    def test_speak_is_dropped_while_muted(self):
+        cfg = dict(voice_hook.DEFAULTS, muted=True)
+        with (mock.patch.object(voice_hook, "daemon_request") as request,
+              mock.patch.object(voice_hook.subprocess, "Popen") as popen):
+            voice_hook.speak("这句不该被念出来", cfg, "s1", "demo")
+        request.assert_not_called()     # 没排进队列
+        popen.assert_not_called()       # 也没降级到 say
+
+    def test_unmuted_speech_still_reaches_the_daemon(self):
+        cfg = dict(voice_hook.DEFAULTS, muted=False)
+        with mock.patch.object(voice_hook, "daemon_request",
+                               return_value={"ok": True, "queue": 1}) as request:
+            voice_hook.speak("这句要念", cfg, "s1", "demo")
+        self.assertEqual(request.call_args.args[0]["cmd"], "speak")
+
+    def test_set_muted_persists_and_silences_now(self):
+        with tempfile.TemporaryDirectory() as home:
+            config = os.path.join(home, "voice_config.json")
+            cfg = dict(voice_hook.DEFAULTS)
+            with (mock.patch.object(voice_hook, "CONFIG_PATH", config),
+                  mock.patch.object(voice_hook, "stop_speaking") as stop):
+                voice_hook.set_muted(cfg, True)
+                stop.assert_called_once()       # 当前这段立刻掐掉，不等它念完
+                with open(config) as f:
+                    self.assertTrue(json.load(f)["muted"])
+
+                stop.reset_mock()
+                voice_hook.set_muted(cfg, False)
+                stop.assert_not_called()
+                with open(config) as f:
+                    self.assertFalse(json.load(f)["muted"])
+
+
+class DaemonMuteTests(unittest.TestCase):
+    """守护进程要认菜单栏刚写下的静音，不能只认启动时读的那份配置。"""
+
+    def make_engine(self, config, muted):
+        with open(config, "w") as f:
+            json.dump({"muted": muted}, f)
+        with mock.patch.object(tts_daemon, "CONFIG_PATH", config):
+            return tts_daemon.Engine(tts_daemon.load_config())
+
+    def test_mute_written_after_startup_is_picked_up(self):
+        with tempfile.TemporaryDirectory() as home:
+            config = os.path.join(home, "voice_config.json")
+            engine = self.make_engine(config, muted=False)
+            with mock.patch.object(tts_daemon, "CONFIG_PATH", config):
+                self.assertFalse(engine.muted())
+                with open(config, "w") as f:
+                    json.dump({"muted": True}, f)
+                stamp = os.path.getmtime(config) + 10    # mtime 必须真的变
+                os.utime(config, (stamp, stamp))
+                self.assertTrue(engine.muted())
+                self.assertEqual(engine.enqueue("别念", "s1", "demo"), 0)
+                self.assertTrue(engine.utt_q.empty())
+
+    def test_hot_reload_leaves_load_time_settings_alone(self):
+        with tempfile.TemporaryDirectory() as home:
+            config = os.path.join(home, "voice_config.json")
+            engine = self.make_engine(config, muted=False)
+            loaded_voice = engine.cfg["moss_ref_audio"]
+            with mock.patch.object(tts_daemon, "CONFIG_PATH", config):
+                with open(config, "w") as f:
+                    json.dump({"muted": True, "moss_ref_audio": "/tmp/other.wav"}, f)
+                stamp = os.path.getmtime(config) + 10
+                os.utime(config, (stamp, stamp))
+                engine.refresh_config()
+            # 参考音频是加载时定死的，热改只会让配置和听到的声音对不上
+            self.assertEqual(engine.cfg["moss_ref_audio"], loaded_voice)
+            self.assertTrue(engine.cfg["muted"])
 
 
 class CodexInstallerTests(unittest.TestCase):

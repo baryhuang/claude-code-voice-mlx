@@ -9,10 +9,15 @@
   UserPromptSubmit -> 你一开口就掐掉正在念的内容（--stop）
 
 命令行：
-  voice_hook.py --test      试听
-  voice_hook.py --toggle    开/关
-  voice_hook.py --stop      立刻闭嘴
-  voice_hook.py --status    看当前配置
+  voice_hook.py --test         试听
+  voice_hook.py --toggle       开/关
+  voice_hook.py --mute         静音（hook 照跑，只是不出声）
+  voice_hook.py --unmute       取消静音
+  voice_hook.py --mute-toggle  静音开关翻转，适合绑快捷键
+  voice_hook.py --stop         立刻闭嘴
+  voice_hook.py --status       看当前配置
+
+静音也可以点菜单栏的喇叭图标（voice-notch），两边改的是同一份配置。
 
 配置：~/.claude/voice_config.json
 """
@@ -54,6 +59,9 @@ DAEMON_PY = os.path.join(HOME, ".claude", "hooks", "tts_daemon.py")
 
 DEFAULTS = {
     "enabled": True,
+    # 静音：hook 照常跑（打断、闭嘴口令这些逻辑还要用），只是不出声。
+    # 菜单栏图标点一下就能改，也可以 --mute / --unmute。
+    "muted": False,
     # moss = MLX 上的克隆模型（声音来自 voice_ref.wav），要常驻进程；
     # say = 系统自带兜底，难听但零依赖
     "engine": "moss",
@@ -163,10 +171,24 @@ def stop_speaking(session=None):
         pass
 
 
+def set_muted(cfg, value):
+    """写配置 + 立刻闭嘴。只写配置的话，当前这段还要念完才安静。"""
+    cfg["muted"] = bool(value)
+    save_config(cfg)
+    if cfg["muted"]:
+        stop_speaking()
+    return cfg["muted"]
+
+
 def speak(text, cfg, session=None, label=None):
     text = text.strip()
     if not text:
         log("speak: 文本为空，跳过")
+        return
+    # 静音在这里拦，不在 main 里拦：打断、闭嘴口令、静音标记这些逻辑
+    # 照常走，取消静音后行为立刻回到正常，不用重来一轮。
+    if cfg.get("muted"):
+        log(f"speak: 静音中，丢弃 {len(text)} 字")
         return
 
     if cfg.get("engine") == "moss":
@@ -550,6 +572,14 @@ def main():
     if "--status" in args:
         print(json.dumps(cfg, indent=2, ensure_ascii=False))
         print(f"config: {CONFIG_PATH}")
+        print(f"静音: {'是' if cfg.get('muted') else '否'}")
+        return
+    if "--mute" in args or "--unmute" in args or "--mute-toggle" in args:
+        if "--mute-toggle" in args:
+            value = not cfg.get("muted", False)
+        else:
+            value = "--mute" in args
+        print("已静音，不再出声" if set_muted(cfg, value) else "已取消静音")
         return
     if "--toggle" in args:
         cfg["enabled"] = not cfg.get("enabled", True)
